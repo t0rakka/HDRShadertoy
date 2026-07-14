@@ -18,19 +18,14 @@
 #include <mango/filesystem/filesystem.hpp>
 #include <mango/math/math.hpp>
 #include <mango/vulkan/vulkan.hpp>
-#include <mango/vulkan/allocator.hpp>
-#include <mango/vulkan/colorspace.hpp>
-#include <mango/vulkan/compiler.hpp>
-#include <mango/vulkan/render_target.hpp>
 
 using namespace mango;
 using namespace mango::math;
+using namespace mango::filesystem;
 using namespace mango::vulkan;
 
 namespace
 {
-
-    constexpr const char* kShaderFolder = "shaders/";
 
     struct CompiledShader
     {
@@ -67,11 +62,9 @@ namespace
         return slash == std::string::npos ? path : path.substr(slash + 1);
     }
 
-    ShaderLibrary loadCompiledShaders(const std::string& folder)
+    ShaderLibrary loadCompiledShaders(Path& path)
     {
-        using namespace mango::filesystem;
-
-        Path shadersDir(folder);
+        Path shadersDir(path, "shaders/");
         const FileIndex& index = shadersDir.getIndex();
 
         std::vector<std::string> names;
@@ -109,7 +102,7 @@ namespace
             File file(shadersDir, name);
             if (!file.size())
             {
-                printLine(Print::Error, "Failed to read shader: {}/{}", folder, name);
+                printLine(Print::Error, "Failed to read shader: {}/{}", shadersDir.pathname(), name);
                 continue;
             }
 
@@ -208,13 +201,12 @@ public:
         m_hdrSwapchain = isHDR(surfaceFormat());
         m_outputOptions = defaultOutputOptions(surfaceFormat(), 1.0f);
 
-        printLine(Print::Info, "Shader player: swapchain {} / {} (HDR: {})",
+        printLine("Shader player: swapchain {} / {} (HDR: {})",
             getString(surfaceFormat().format),
             getString(surfaceFormat().colorSpace),
             m_hdrSwapchain ? "yes" : "no");
 
-        printLine(Print::Info, "Loaded {} shaders from {}", m_library.shaders.size(), kShaderFolder);
-        printLine(Print::Info, "Use LEFT/RIGHT to cycle shaders.");
+        printLine("Use LEFT/RIGHT to cycle shaders.");
 
         createComputeResources();
         applyShader(m_shaderIndex);
@@ -649,7 +641,6 @@ int mangoMain(const mango::CommandLine& commands)
     std::vector<const char*> enabledLayers;
     bool validation = false;
     bool forceSdr = false;
-    std::string initialShader;
 
     for (size_t i = 1; i < commands.size(); ++i)
     {
@@ -667,38 +658,28 @@ int mangoMain(const mango::CommandLine& commands)
         {
             forceSdr = true;
         }
-        else if (arg == "--shader" && i + 1 < commands.size())
-        {
-            initialShader = std::string(commands[++i]);
-        }
         else if (arg == "--help" || arg == "-h")
         {
             printLine("shadertoy  [--shader <file.comp>] [--info] [--validate] [--sdr]");
-            printLine("  --shader     initial shader from {} folder", kShaderFolder);
             printLine("  --info       log device/swapchain details");
             printLine("  --validate   enable Khronos validation layer + debug messenger");
             printLine("  --sdr        force SDR swapchain (tonemap fallback)");
             printLine("  LEFT/RIGHT   cycle through shaders");
+            printLine("  MOUSE        mouse movement is used by some shaders");
             return 0;
-        }
-        else if (!arg.empty() && arg[0] != '-')
-        {
-            initialShader = arg;
         }
     }
 
-    const ShaderLibrary library = loadCompiledShaders(kShaderFolder);
+    Path path("data/");
+
+    const ShaderLibrary library = loadCompiledShaders(path);
     if (library.shaders.empty())
     {
-        printLine(Print::Error, "No compiled shaders found in {}", kShaderFolder);
+        printLine(Print::Error, "No shaders found in {}", path.pathname());
         return 1;
     }
 
     size_t initialIndex = 0;
-    if (!initialShader.empty())
-    {
-        initialIndex = findShaderIndex(library, basename(initialShader));
-    }
 
     if (validation)
     {

@@ -22,13 +22,13 @@ add_executable(shadertoy WIN32 ${sources})
 # copy shaders to output directory
 # ----------------------------------------------------------------------
 
-file(GLOB shadertoy_shaders CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.comp")
+file(GLOB shadertoy_shaders CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/data/shaders/*.comp")
 
 add_custom_command(TARGET shadertoy POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:shadertoy>/shaders"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:shadertoy>/data/shaders"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${shadertoy_shaders}
-        "$<TARGET_FILE_DIR:shadertoy>/shaders"
+        "$<TARGET_FILE_DIR:shadertoy>/data/shaders"
     COMMENT "Copying shaders to output directory"
     VERBATIM
 )

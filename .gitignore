@@ -1,0 +1,60 @@
+
+# -------------------------------------------
+# Linux / Android
+# -------------------------------------------
+
+*.o
+*.so*
+*.a
+*.d
+
+# -------------------------------------------
+# OS X
+# -------------------------------------------
+
+*.DS_Store
+*.dylib
+*.xcworkspacedata
+*.xcscheme
+*.xcuserstate
+*.plist
+*.xcsettings
+
+# -------------------------------------------
+# Windows
+# -------------------------------------------
+
+*.tlog
+*.obj
+*.pdb
+*.idb
+*.suo
+*.sdf
+*.log
+*.lastbuildstate
+*.lib
+*.opensdf
+*.db
+*.ipch
+*.opendb
+*.FileListAbsolute.txt
+*.recipe
+*.VC.db-shm
+*.VC.db-wal
+
+# -------------------------------------------
+# Others
+# -------------------------------------------
+
+*.vscode
+CMakeFiles
+CMakeCache.txt
+*.cmake
+!cmake/*.cmake
+install_manifest.txt
+Makefile
+build
+build-emscripten
+.ninja_deps
+.ninja_log
+build.ninja

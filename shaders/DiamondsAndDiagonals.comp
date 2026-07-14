@@ -1,0 +1,208 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+// Diamonds And Diagonals — Blackle Mori
+// CC0 1.0 Universal
+
+vec3 erot(vec3 p, vec3 ax, float ro)
+{
+    return mix(ax * dot(p, ax), p, cos(ro)) + cross(ax, p) * sin(ro);
+}
+
+float fact(vec3 p, float s)
+{
+    return dot(asin(sin(p) * s), vec3(1.0)) / sqrt(3.0);
+}
+
+vec2 scene(vec3 p)
+{
+    float a1 = fact(erot(p, vec3(1.0, 0.0, 0.0), 2.0), 0.9);
+    float a2 = fact(erot(p, vec3(0.0, 1.0, 0.0), 1.5), 0.9);
+    float a3 = fact(erot(p, vec3(0.0, 0.0, 1.0), 2.0), 0.9);
+    float a4 = fact(erot(p, normalize(vec3(0.0, 1.0, 1.0)), 0.59), 0.999);
+    float s1 = (a1 + a2 + a3) / 2.0 - 1.0 + length(p.yz) * 0.1;
+    s1 = min(s1, length(p.yz) - 1.0);
+    float s2 = a4 - 1.5;
+
+    if (s1 < s2)
+    {
+        return vec2(s2, 0.0);
+    }
+
+    return vec2(s1, 1.0);
+}
+
+vec3 norm(vec3 p)
+{
+    mat3 k = mat3(p, p, p) - mat3(0.01);
+    float d0 = scene(p).x;
+    return normalize(vec3(d0) - vec3(scene(k[0]).x, scene(k[1]).x, scene(k[2]).x));
+}
+
+vec3 randomdir(int stage)
+{
+    vec3 dotdir = vec3(1.0);
+    if (stage % 5 == 0)
+    {
+        dotdir.x *= -1.0;
+    }
+    if (stage % 5 == 1)
+    {
+        dotdir.y *= -1.0;
+    }
+    if (stage % 5 == 2)
+    {
+        dotdir.z *= -1.0;
+    }
+    if (stage % 5 == 3)
+    {
+        dotdir.x *= 0.0;
+    }
+    if (stage % 6 == 0)
+    {
+        dotdir.xyz = dotdir.yzx;
+    }
+
+    return dotdir;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord)
+{
+    vec2 uv = (fragCoord - 0.5 * iResolution.xy) / iResolution.y;
+
+    float t = iTime;
+    t += length(uv) * 2.5 * pow(sin(t * 0.4) * 0.5 + 0.5, 8.0);
+
+    int stage0 = int(t + 0.5);
+    float swipedir = ((stage0 / 2) % 2 == 0 ? -1.0 : 1.0) * (stage0 % 2 == 0 ? uv.x : uv.y);
+
+    int stage = int(t + swipedir * 0.25);
+    float sdiff = t - float(stage);
+
+    vec3 cam = normalize(vec3(0.6 + sin(float(stage) * 3.1415 + 1.5 * smoothstep(-0.5, 0.5, cos(sdiff * 3.0))) * 0.3, uv));
+    vec3 init = vec3(cos(t * 0.3) / 0.3 * 0.5, 0.0, 0.0);
+
+    float rdir = (stage % 3 == 0 ? -1.0 : 1.0);
+    if (stage % 5 > 1)
+    {
+        rdir *= 0.0;
+    }
+
+    float zrot = t * 0.2 * rdir + float(stage);
+    float yrot = sin(t * 0.0555 * rdir) * 0.3;
+    float xrot = smoothstep(-0.65, 0.65, cos(sdiff * 3.0)) * rdir;
+    cam = erot(cam, vec3(1.0, 0.0, 0.0), xrot);
+    cam = erot(cam, vec3(0.0, 1.0, 0.0), yrot);
+    cam = erot(cam, vec3(0.0, 0.0, 1.0), zrot);
+
+    vec3 p = init;
+    bool hit = false;
+    int lid = 0;
+
+    for (int i = 0; i < 150 && !hit; i++)
+    {
+        if (distance(p, init) > 400.0)
+        {
+            break;
+        }
+
+        vec2 sd = scene(p);
+        float d = sd.x;
+        if (d * d < 0.00001)
+        {
+            hit = true;
+            lid = int(sd.y);
+        }
+
+        p += cam * d;
+    }
+
+    float fog = smoothstep(0.0, (stage % 7 - stage % 5 < 0) ? 20.0 : 100.0, distance(p, init));
+    vec3 n = norm(p);
+    vec3 r = reflect(cam, n);
+
+    float ao = 1.0;
+    ao *= smoothstep(-0.5, 0.5, scene(p + n * 0.5).x);
+    ao *= smoothstep(-1.0, 1.0, scene(p + n * 1.0).x);
+    ao *= smoothstep(-2.0, 2.0, scene(p + n * 2.0).x);
+
+    float fres = 1.0 - abs(dot(cam, n)) * 0.98;
+    float rfact = length(sin(r * 3.5) * 0.5 + 0.5) / sqrt(3.0);
+    float dfact = length(sin(n * 2.5) * 0.4 + 0.6) / sqrt(3.0);
+    rfact = rfact * 0.2 + pow(rfact, 8.0) * 6.0;
+
+    float stripes = asin(sin(dot(randomdir(stage), p) * 3.0 + t));
+    if (stage % 4 == 0)
+    {
+        stripes *= asin(sin(dot(randomdir(stage + 7), p) * 3.0 + t));
+    }
+
+    vec3 dcolor = vec3(0.85, 0.4, 0.05);
+    if (stage % 3 == 0)
+    {
+        dcolor = vec3(0.85, 0.1, 0.05);
+    }
+    if (stage % 3 == 1)
+    {
+        dcolor = vec3(0.85, 0.8, 0.05);
+    }
+    if (lid == 0)
+    {
+        dcolor = dcolor.zxy;
+    }
+    else
+    {
+        dcolor *= smoothstep(-0.05, 0.05, stripes);
+    }
+
+    vec3 col = (vec3(rfact * fres) + dcolor * dfact) * ao;
+
+    if (!hit)
+    {
+        fog = 1.0;
+    }
+
+    fragColor.xyz = mix(col, vec3(1.1), fog);
+    fragColor.xyz *= 1.0 - dot(uv, uv) * 0.8;
+
+    if (stage % 4 == 1)
+    {
+        fragColor.xyz = 1.0 - fragColor.xyz;
+    }
+    if (stage % 4 == 3)
+    {
+        fragColor.xyz = 1.0 - fragColor.xxx;
+    }
+
+    fragColor = vec4(max(fragColor.xyz, vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

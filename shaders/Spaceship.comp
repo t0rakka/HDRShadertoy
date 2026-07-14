@@ -1,0 +1,330 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+// "Britney's Spaceship" — Kali
+// https://www.shadertoy.com/view/MdX3Rr
+
+//#define LESSDETAIL
+
+#define RAY_STEPS 100
+#define SHADOW_STEPS 50
+#define LIGHT_COLOR vec3(1.0, 0.97, 0.93)
+#define AMBIENT_COLOR vec3(0.75, 0.65, 0.6)
+#define SPECULAR 0.65
+#define DIFFUSE 1.0
+#define AMBIENT 0.35
+#define detail 0.00004
+#define t (iTime * 0.2)
+
+vec3 lightdir = normalize(vec3(0.1, -0.15, -1.0));
+const vec3 origin = vec3(-1.0, 0.2, 0.0);
+
+mat2 rot(float a)
+{
+    float c = cos(a);
+    float s = sin(a);
+    return mat2(c, s, -s, c);
+}
+
+const vec3 kNeonGreen = vec3(0.2, 1.0, 0.15);
+
+/*
+float hash21(vec2 p)
+{
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+vec3 channelTex(vec2 uv)
+{
+    vec2 p = uv * vec2(6.0, 4.0);
+    vec2 id = floor(p);
+    float h = hash21(id);
+    float scan = 0.6 + 0.4 * sin(p.y * 30.0 + iTime * 3.0);
+    vec3 bars = 0.5 + 0.5 * cos(vec3(0.0, 2.0, 4.0) + p.x * 2.5 + h * 6.283);
+    return mix(vec3(h * 0.4, h * h, h * 0.25), bars, 0.55) * scan;
+}
+*/
+
+vec4 formula(vec4 p)
+{
+    p.xz = abs(p.xz + 1.0) - abs(p.xz - 1.0) - p.xz;
+    p = p * 2.0 / clamp(dot(p.xyz, p.xyz), 0.15, 1.0) - vec4(0.5, 0.5, 0.8, 0.0);
+    p.xy *= rot(0.5);
+    return p;
+}
+
+float screen(vec3 p)
+{
+    float d1 = length(p.yz - vec2(0.25, 0.0)) - 0.5;
+    float d2 = length(p.yz - vec2(0.25, 2.0)) - 0.5;
+    return min(max(d1, abs(p.x - 0.3) - 0.01), max(d2, abs(p.x + 2.3) - 0.01));
+}
+
+vec2 de(vec3 pos)
+{
+    float hid = 0.0;
+    vec3 tpos = pos;
+    tpos.z = abs(2.0 - mod(tpos.z, 4.0));
+    vec4 p = vec4(tpos, 1.5);
+
+#ifdef LESSDETAIL
+    for (int i = 0; i < 6; i++)
+    {
+        p = formula(p);
+    }
+    float fr = max(-tpos.x - 4.0, (length(max(vec2(0.0), p.yz - 2.0)) - 0.5) / p.w);
+#else
+    for (int i = 0; i < 8; i++)
+    {
+        p = formula(p);
+    }
+    float fr = max(-tpos.x - 4.0, length(max(vec2(0.0), p.yz - 3.0)) / p.w);
+#endif
+
+    float sc = screen(tpos);
+    float d = min(sc, fr);
+    if (abs(d - sc) < 0.001)
+    {
+        hid = 1.0;
+    }
+
+    return vec2(d, hid);
+}
+
+vec2 colorize(vec3 p)
+{
+    p.z = abs(2.0 - mod(p.z, 4.0));
+    float es = 0.0;
+    float l = 0.0;
+    float ot = 1000.0;
+
+    for (int i = 0; i < 15; i++)
+    {
+        p = formula(vec4(p, 0.0)).xyz;
+        float pl = l;
+        l = length(p);
+        es += exp(-10.0 / abs(l - pl));
+        ot = min(ot, abs(l - 3.0));
+    }
+
+    return vec2(es, ot);
+}
+
+vec3 path(float ti)
+{
+    return vec3(sin(ti) * 2.0, (1.0 - sin(ti * 0.5)) * 0.5, -cos(ti * 0.25) * 30.0) * 0.5;
+}
+
+vec3 normal(vec3 p, float eps)
+{
+    vec3 e = vec3(0.0, eps, 0.0);
+    return normalize(vec3(
+        de(p + e.yxx).x - de(p - e.yxx).x,
+        de(p + e.xyx).x - de(p - e.xyx).x,
+        de(p + e.xxy).x - de(p - e.xxy).x));
+}
+
+float shadow(vec3 pos, vec3 sdir, float eps)
+{
+    float sh = 1.0;
+    float totdist = 2.0 * eps;
+    float dist = 10.0;
+
+    for (int steps = 0; steps < SHADOW_STEPS; steps++)
+    {
+        if (totdist < 1.0 && dist > detail)
+        {
+            vec3 p = pos - totdist * sdir;
+            dist = de(p).x;
+            sh = min(sh, max(50.0 * dist / totdist, 0.0));
+            totdist += max(0.01, dist);
+        }
+    }
+
+    return clamp(sh, 0.1, 1.0);
+}
+
+float calcAO(const vec3 pos, const vec3 nor)
+{
+    float aodet = detail * 40.0;
+    float totao = 0.0;
+    float sca = 13.0;
+
+    for (int aoi = 0; aoi < 5; aoi++)
+    {
+        float hr = aodet * float(aoi * aoi);
+        vec3 aopos = nor * hr + pos;
+        float dd = de(aopos).x;
+        totao += -(dd - hr) * sca;
+        sca *= 0.7;
+    }
+
+    return clamp(1.0 - 5.0 * totao, 0.0, 1.0);
+}
+
+vec3 light(in vec3 p, in vec3 dir, in vec3 n, in float hid, float eps)
+{
+    float sh = shadow(p, lightdir, eps);
+    float ao = calcAO(p, n);
+    float diff = max(0.0, dot(lightdir, -n)) * sh * DIFFUSE;
+    vec3 amb = max(0.5, dot(dir, -n)) * AMBIENT * AMBIENT_COLOR;
+    vec3 r = reflect(lightdir, n);
+    float spec = pow(max(0.0, dot(dir, -r)) * sh, 15.0) * SPECULAR;
+    vec3 col;
+    vec2 getcol = colorize(p);
+
+    if (hid > 0.5)
+    {
+        col = vec3(1.0);
+        spec = spec * spec;
+    }
+    else
+    {
+        float k = pow(getcol.x * 0.11, 2.0);
+        col = mix(vec3(k, k * k, k * k), vec3(k), 0.5) + 0.1;
+        col += pow(max(0.0, 1.0 - getcol.y), 5.0) * 0.3;
+    }
+
+    col = col * ao * (amb + diff * LIGHT_COLOR) + spec * LIGHT_COLOR;
+
+    if (hid > 0.5)
+    {
+        vec3 p2 = p;
+        p2.z = abs(1.0 - mod(p2.z, 2.0));
+        // vec3 c = channelTex(mod(1.0 - p.zy - vec2(0.4, 0.2), vec2(1.0))) * 2.0;
+        vec3 c = kNeonGreen * 2.0;
+        col += c * abs(0.01 - mod(p.y - iTime * 0.1, 0.02)) / 0.01 * ao;
+        col *= max(0.0, 1.0 - pow(length(p2.yz - vec2(0.25, 1.0)), 2.0) * 3.5);
+    }
+    else
+    {
+        // vec3 c = channelTex(mod(p.zx * 2.0 + vec2(0.5), vec2(1.0)));
+        vec3 c = kNeonGreen;
+        c *= abs(0.01 - mod(p.x - iTime * 0.1 * sign(p.x + 1.0), 0.02)) / 0.01;
+        col += pow(getcol.x, 10.0) * 3e-10 * c;
+        col += pow(max(0.0, 1.0 - getcol.y), 4.0)
+            * pow(max(0.0, 1.0 - abs(1.0 - mod(p.z + iTime * 2.0, 4.0))), 2.0)
+            * vec3(1.0, 0.8, 0.4) * 4.0
+            * max(0.0, 0.05 - abs(p.x + 1.0)) / 0.05;
+    }
+
+    return col;
+}
+
+vec3 raymarch(in vec3 from, in vec3 dir)
+{
+    float glow = 0.0;
+    float totdist = 0.0;
+    vec2 d = vec2(1.0, 0.0);
+    vec3 p = vec3(0.0);
+    vec3 col = vec3(0.0);
+    float hitEps = detail;
+
+    for (int i = 0; i < RAY_STEPS; i++)
+    {
+        if (d.x > hitEps && totdist < 30.0)
+        {
+            p = from + totdist * dir;
+            d = de(p);
+            hitEps = detail * (1.0 + totdist * 50.0);
+            totdist += d.x;
+            if (d.x < 0.015)
+            {
+                glow += max(0.0, 0.015 - d.x) * exp(-totdist);
+            }
+        }
+    }
+
+    float l = max(0.0, dot(normalize(-dir), normalize(lightdir)));
+    vec3 backg = vec3(max(0.0, -dir.y + 0.6)) * AMBIENT_COLOR * 0.5 * max(0.4, l);
+
+    if (d.x < hitEps || totdist < 30.0)
+    {
+        p = p - abs(d.x - hitEps) * dir;
+        vec3 norm = normal(p, hitEps);
+        col = light(p, dir, norm, d.y, hitEps);
+        col = mix(col, backg, 1.0 - exp(-0.15 * pow(totdist, 1.5)));
+    }
+    else
+    {
+        col = backg;
+        vec3 st = (dir * 3.0 + vec3(1.3, 2.5, 1.25)) * 0.3;
+        for (int i = 0; i < 13; i++)
+        {
+            st = abs(st) / dot(st, st) - 0.9;
+        }
+        col += min(1.0, pow(min(5.0, length(st)), 3.0) * 0.0025);
+    }
+
+    vec3 lglow = LIGHT_COLOR * pow(l, 25.0) * 0.5;
+    col += glow * (0.5 + l * 0.5) * LIGHT_COLOR * 0.7;
+    col += lglow * exp(min(30.0, totdist) * 0.02);
+    return col;
+}
+
+vec3 move(inout vec3 dir)
+{
+    vec3 go = path(t);
+    vec3 adv = path(t + 0.7);
+    vec3 advec = normalize(adv - go);
+    float an = adv.x - go.x;
+    an *= min(1.0, abs(adv.z - go.z)) * sign(adv.z - go.z) * 0.7;
+    dir.xy *= rot(an);
+    an = advec.y * 1.7;
+    dir.yz *= rot(an);
+    an = atan(advec.x, advec.z);
+    dir.xz *= rot(an);
+    return go;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord)
+{
+    vec2 uv = fragCoord.xy / iResolution.xy * 2.0 - 1.0;
+    uv.y *= iResolution.y / iResolution.x;
+
+    float mouseX = iMouse.x;
+    float mouseY = iResolution.y - iMouse.y;
+    vec2 mouse = (vec2(mouseX, mouseY) / iResolution.xy - 0.5) * 3.0;
+    if (iMouse.z < 1.0)
+    {
+        mouse = vec2(0.0, -0.2);
+    }
+
+    vec3 dir = normalize(vec3(uv * 0.8, 1.0));
+    dir.yz *= rot(mouse.y);
+    dir.xz *= rot(mouse.x);
+    vec3 from = origin + move(dir);
+    vec3 color = raymarch(from, dir);
+
+    fragColor = vec4(max(color, vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

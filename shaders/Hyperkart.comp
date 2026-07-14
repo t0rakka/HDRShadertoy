@@ -1,0 +1,129 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+// Hyperkart
+// https://www.shadertoy.com/view/3l23Rh
+
+#define T (sin(iTime * 0.6) * 64.0 + iTime * 2e2)
+#define P(z) (vec3(cos((z) * 0.015) * 16.0 + cos((z) * 0.006) * 64.0, cos((z) * 0.011) * 24.0 + cos((z) * 0.009) * 32.0, (z)))
+#define R(a) mat2(cos(a + vec4(0.0, 33.0, 11.0, 0.0)))
+#define N normalize
+
+float boxen(vec3 p)
+{
+    p = abs(fract(p / 4e1) * 4e1 - 2e1) - 2.0;
+    return min(p.x, min(p.y, p.z));
+}
+
+float map(vec3 p, inout vec4 lights)
+{
+    vec3 q = P(p.z);
+    float g = q.y - p.y + 6.0;
+    float m = boxen(p);
+
+    p.xy -= q.xy;
+
+    float red;
+    float blue;
+    float e = min(
+        red = length(p.xy - sin(p.y / 12.0 + vec2(5.0, 1.0)) * 12.0) - 1.0,
+        blue = length(p.xy - sin(p.y / 12.0 + vec2(0.0, 1.0)) * 12.0) - 1.0);
+
+    lights += vec4(2.0, 1e1, 1e1, 0.0) / (0.1 + abs(red) / 1e1);
+    lights += vec4(1e1, 2.0, 1e1, 0.0) / (0.1 + abs(blue) / 1e1);
+
+    p = abs(p);
+
+    float tex = abs(length(sin(p * cos(p.yzx / 3e1) * 4.0) / (p * 4.0)));
+    float tun = min(64.0 - p.x - p.y + m, 32.0 - p.y - m);
+    float d = max(min(m, g), tun) - tex;
+
+    return min(e, d);
+}
+
+void mainImage(out vec4 o, in vec2 u)
+{
+    float i = 0.0;
+    float s = 0.0;
+    float d = 0.0;
+    vec3 r = iResolution;
+
+    u = (u - r.xy * 0.5) / r.y;
+    u.y -= 0.2;
+
+    o = vec4(0.0);
+    vec4 lights = vec4(0.0);
+
+    vec3 p = P(T);
+    vec3 ro = p;
+    vec3 Z = N(P(T + 1e1) - p);
+    vec3 X = N(vec3(Z.z, 0.0, -Z.x));
+    vec3 D = N(vec3(R(sin(T * 0.005) * 0.4) * u, 1.0) * mat3(-X, cross(X, Z), Z));
+
+    for (; i < 128.0; i++)
+    {
+        p = ro + D * d;
+        d += s = map(p, lights) * 0.8;
+        o += lights + 1.0 / max(s, 0.01);
+    }
+
+    const float h = 0.005;
+    const vec2 k = vec2(1.0, -1.0);
+    vec4 dummyLights = vec4(0.0);
+    vec3 n = N(
+        k.xyy * map(p + k.xyy * h, dummyLights) +
+        k.yyx * map(p + k.yyx * h, dummyLights) +
+        k.yxy * map(p + k.yxy * h, dummyLights) +
+        k.xxx * map(p + k.xxx * h, dummyLights));
+
+    o *= 0.1 + max(dot(n, -D), 0.0);
+
+    vec4 ref = vec4(0.0);
+    lights = vec4(0.0);
+    p += n * 0.05;
+    D = reflect(D, n);
+    s = 0.0;
+    i = 0.0;
+
+    for (; i < 40.0; i++)
+    {
+        p += D * s;
+        s = map(p, lights) * 0.8;
+        ref += lights + 1.0 / max(s, 0.01);
+    }
+
+    o += o * ref;
+    o = o / (6e6 * max(d, 0.01));
+
+    o = vec4(max(o.rgb, vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+// Plasma — @XorDev
+// https://x.com/XorDev/status/1894123951401378051
+
+void mainImage(out vec4 O, in vec2 I)
+{
+    vec2 r = iResolution.xy;
+    vec2 p = (I + I - r) / r.y;
+    vec2 z = vec2(0.0);
+    vec2 i = vec2(0.0);
+    vec2 f = p * (z += 4.0 - 4.0 * abs(0.7 - dot(p, p)));
+
+    O = vec4(0.0);
+    for (; i.y++ < 8.0; )
+    {
+        O += (sin(f) + 1.0).xyyx * abs(f.x - f.y);
+        f += cos(f.yx * i.y + i + iTime) / i.y + 0.7;
+    }
+
+    // Original: O = tanh(7.*exp(z.x-4.-p.y*vec4(-1,1,2,0))/O);
+    O = 7.0 * exp(z.x - 4.0 - p.y * vec4(-1.0, 1.0, 2.0, 0.0)) / max(O, vec4(0.001));
+    O = vec4(max(O.rgb, vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

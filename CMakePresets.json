@@ -1,0 +1,49 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 19 },
+    "configurePresets": [
+        {
+            "name": "ninja",
+            "description": "Ninja configuration for cross-platform builds",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "vcpkg",
+            "description": "vcpkg toolchain",
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            }
+        },
+        {
+            "name": "default",
+            "description": "macOS/Linux Release build using Ninja",
+            "inherits": ["ninja"],
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "windows",
+            "description": "Windows Ninja Release build with vcpkg toolchain",
+            "inherits": ["ninja", "vcpkg"],
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default",
+            "configurePreset": "default",
+            "jobs": 0
+        },
+        {
+            "name": "windows",
+            "configurePreset": "windows",
+            "jobs": 0
+        }
+    ]
+}

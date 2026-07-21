@@ -1,4 +1,4 @@
-# HDR Shadertoy
+<h1><img src="logo.png"/></h1>
 
 A Vulkan **HDR viewer** for [Shadertoy](https://www.shadertoy.com/) effects, converted to **compute shaders**.
 

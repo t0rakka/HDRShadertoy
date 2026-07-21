@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Heeelix
+    Author:  unzip
+    License: 
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -15,9 +21,6 @@ layout(push_constant) uniform Push
 #define iTime push.time
 #define iResolution vec3(push.resolution, 1.0)
 #define iMouse push.mouse
-
-// Heeelix — animated helix unzip
-// https://www.shadertoy.com/view/MstcWs
 
 //#define ANOTHER_LEVEL
 
@@ -459,10 +462,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     color *= vec3(0.9, 0.95, 1.0) * vig * 1.1;
     color = mix(color, vec3(pow(length(color * 0.6), 2.0)), 0.1);
     color *= 1.05;
-    // Shadertoy display grade (not filmic tonemap) — adds contrast/saturation vs bare linear.
-    color = pow(max(color, vec3(0.0)), vec3(1.2, 1.3, 1.2));
-
-    fragColor = vec4(color, 1.0);
+    // Keep scene-linear HDR — dropped Shadertoy display-grade pow().
+    fragColor = vec4(max(color, vec3(0.0)), 1.0);
 }
 
 void main()

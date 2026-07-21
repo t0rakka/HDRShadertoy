@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Inside the mandelbulb
+    Author:  mrange
+    License: CC0
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -15,10 +21,6 @@ layout(push_constant) uniform Push
 #define iTime push.time
 #define iResolution vec3(push.resolution, 1.0)
 #define iMouse push.mouse
-
-// CC0: Inside the mandelbulb
-//  Simple extension of the earlier refraction shaders but it turned out mandelbulb had a bit of an interesting inside
-//  so shared the result
 
 //  Mandelbulb iterations => atan, asin and pow => Poor GPU.
 
@@ -63,23 +65,6 @@ const vec3 diffuseCol = HSV2RGB(vec3(hoff+0.6, 0.85, 1.0));
 const vec3 lightPos   = vec3(0.0, 10.0, 0.0);
 
 const float initt       = 0.1; 
-
-// License: Unknown, author: nmz (twitter: @stormoid), found: https://www.shadertoy.com/view/NdfyRM
-vec3 sRGB(vec3 t) {
-  return mix(1.055*pow(t, vec3(1./2.4)) - 0.055, 12.92*t, step(t, vec3(0.0031308)));
-}
-
-// License: Unknown, author: Matt Taylor (https://github.com/64), found: https://64.github.io/tonemapping/
-vec3 aces_approx(vec3 v) {
-  v = max(v, 0.0);
-  v *= 0.6;
-  float a = 2.51;
-  float b = 0.03;
-  float c = 2.43;
-  float d = 0.59;
-  float e = 0.14;
-  return clamp((v*(a*v+b))/(v*(c*v+d)+e), 0.0, 1.0);
-}
 
 // License: MIT, author: Inigo Quilez, found: https://iquilezles.org/www/articles/distfunctions2d/distfunctions2d.htm
 float box(vec2 p, vec2 b) {
@@ -181,7 +166,7 @@ vec3 skyColor(vec3 ro, vec3 rd) {
     col += vec3(0.25)*skyCol*exp(-.5*max(ds, 0.0));
   }
 
-  return clamp(col, 0.0, 10.0);
+  return max(col, vec3(0.0));
 }
 
 float df(vec3 p) {
@@ -314,9 +299,8 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
   p.x *= RESOLUTION.x/RESOLUTION.y;
   vec3 col = vec3(0.0);
   col = effect(p);
-  col = aces_approx(col); 
-  col = sRGB(col);
-  fragColor = vec4(col, 1.0);
+  // Keep scene-linear HDR — host does resolve/tonemap for the swapchain.
+  fragColor = vec4(max(col, vec3(0.0)), 1.0);
 }
 
 void main()

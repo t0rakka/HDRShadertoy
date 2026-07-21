@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Mars Terrain
+    Author:  mrange
+    License: CC0 1.0 Universal
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -21,11 +27,6 @@ layout(push_constant) uniform Push
 //  ray tracer for a friend.
 
 // It would benefit from some TAA but that would make it more complicated
-
-// This file is released under CC0 1.0 Universal (Public Domain Dedication).
-// To the extent possible under law, mrange has waived all copyright
-// and related or neighboring rights to this work.
-// See <https://creativecommons.org/publicdomain/zero/1.0/> for details.
 
 // License: WTFPL, author: sam hocevar, found: https://stackoverflow.com/a/17897228/418488
 const vec4 hsv2rgb_K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);

@@ -1,0 +1,368 @@
+/*
+    Shader:  Inside the mandelbulb II (FXAA)
+    Author:  mrange (CC0) / fork dtBczt
+    License: CC0
+    URL:     https://www.shadertoy.com/view/dtBczt
+*/
+
+#CHANNEL(Image, 0, A)
+
+#SHADER(A)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+#define LOOPS   5
+#define POWER   8.0
+#define ANIMATE
+
+#define PI              3.141592654
+#define TAU             (2.0*PI)
+#define PHI             (sqrt(5.0)*0.5 + 0.5)
+
+#define TIME            iTime
+#define RESOLUTION      iResolution
+
+#define TOLERANCE       0.0001
+#define MAX_RAY_LENGTH  5.0
+#define MAX_RAY_MARCHES 10
+#define NORM_OFF        0.005
+#define MAX_BOUNCES     5
+
+mat3 g_rot  = mat3(1.0);
+vec3 g_mat  = vec3(0.0);
+vec3 g_beer = vec3(0.0);
+
+const vec4 hsv2rgb_K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+vec3 hsv2rgb(vec3 c) {
+  vec3 p = abs(fract(c.xxx + hsv2rgb_K.xyz) * 6.0 - hsv2rgb_K.www);
+  return c.z * mix(hsv2rgb_K.xxx, clamp(p - hsv2rgb_K.xxx, 0.0, 1.0), c.y);
+}
+#define HSV2RGB(c)  (c.z * mix(hsv2rgb_K.xxx, clamp(abs(fract(c.xxx + hsv2rgb_K.xyz) * 6.0 - hsv2rgb_K.www) - hsv2rgb_K.xxx, 0.0, 1.0), c.y))
+
+const float hoff = 0.0;
+const vec3 skyCol     = HSV2RGB(vec3(hoff+0.6, 0.50, 1.0));
+const vec3 glowCol    = HSV2RGB(vec3(hoff+0.065, 0.8, 6.0));
+const vec3 diffuseCol = HSV2RGB(vec3(hoff+0.6, 0.85, 1.0));
+const vec3 lightPos   = vec3(0.0, 10.0, 0.0);
+const float initt       = 0.1;
+
+float box(vec2 p, vec2 b) {
+  vec2 d = abs(p)-b;
+  return length(max(d,0.0)) + min(max(d.x,d.y),0.0);
+}
+
+float rayPlane(vec3 ro, vec3 rd, vec4 p) {
+  return -(dot(ro,p.xyz)+p.w)/dot(rd,p.xyz);
+}
+
+float mandelBulb(vec3 p) {
+  const float power = POWER;
+  vec3 z  = p;
+  float r, theta, phi;
+  float dr = 1.0;
+
+  for(int i = 0; i < LOOPS; ++i) {
+    r = length(z);
+    if(r > 2.0) continue;
+    theta = atan(z.y, z.x);
+#ifdef ANIMATE
+    phi = asin(z.z / r) + TIME*0.2;
+#else
+    phi = asin(z.z / r);
+#endif
+    dr = pow(r, power - 1.0) * dr * power + 1.0;
+    r = pow(r, power);
+    theta = theta * power;
+    phi = phi * power;
+    z = r * vec3(cos(theta)*cos(phi), sin(theta)*cos(phi), sin(phi)) + p;
+  }
+  return 0.5 * log(r) * r / dr;
+}
+
+mat3 rot_z(float a) {
+  float c = cos(a);
+  float s = sin(a);
+  return mat3(c,s,0, -s,c,0, 0,0,1);
+}
+
+mat3 rot_y(float a) {
+  float c = cos(a);
+  float s = sin(a);
+  return mat3(c,0,s, 0,1,0, -s,0,c);
+}
+
+mat3 rot_x(float a) {
+  float c = cos(a);
+  float s = sin(a);
+  return mat3(1,0,0, 0,c,s, 0,-s,c);
+}
+
+vec3 skyColor(vec3 ro, vec3 rd) {
+  vec3 col = clamp(vec3(0.0025/abs(rd.y))*skyCol, 0.0, 1.0);
+
+  float tp0  = rayPlane(ro, rd, vec4(vec3(0.0, 1.0, 0.0), 4.0));
+  float tp1  = rayPlane(ro, rd, vec4(vec3(0.0, -1.0, 0.0), 6.0));
+
+  if (tp1 > 0.0) {
+    vec3 pos  = ro + tp1*rd;
+    vec2 pp = pos.xz;
+    float db = box(pp, vec2(6.0, 9.0))-1.0;
+    col += vec3(4.0)*skyCol*rd.y*rd.y*smoothstep(0.25, 0.0, db);
+    col += vec3(0.8)*skyCol*exp(-0.5*max(db, 0.0));
+  }
+
+  if (tp0 > 0.0) {
+    vec3 pos  = ro + tp0*rd;
+    vec2 pp = pos.xz;
+    float ds = length(pp) - 0.5;
+    col += vec3(0.25)*skyCol*exp(-.5*max(ds, 0.0));
+  }
+
+  return max(col, vec3(0.0));
+}
+
+float df(vec3 p) {
+  p *= g_rot;
+  vec3 p1 = p;
+  const float z1 = 2.0;
+  float d1 = mandelBulb(p1/z1)*z1;
+
+  vec3 mat = vec3(0.8, 0.5, (1.+0.05));
+  const vec3 gcol = HSV2RGB(vec3(0.05, 0.95, 2.0));
+  vec3 beer = -gcol;
+
+  float d = d1;
+  g_mat = mat;
+  g_beer = beer;
+  return d;
+}
+
+vec3 normal(vec3 pos) {
+  vec2  eps = vec2(NORM_OFF,0.0);
+  vec3 nor;
+  nor.x = df(pos+eps.xyy) - df(pos-eps.xyy);
+  nor.y = df(pos+eps.yxy) - df(pos-eps.yxy);
+  nor.z = df(pos+eps.yyx) - df(pos-eps.yyx);
+  return normalize(nor);
+}
+
+float rayMarch(vec3 ro, vec3 rd, float dfactor, out int ii) {
+  float t = 0.0;
+  ii = MAX_RAY_MARCHES;
+  for (int i = 0; i < MAX_RAY_MARCHES; ++i) {
+    if (t > MAX_RAY_LENGTH) {
+      t = MAX_RAY_LENGTH;
+      break;
+    }
+    float d = dfactor*df(ro + rd*t);
+    if (d < TOLERANCE) {
+      ii = i;
+      break;
+    }
+    t += d;
+  }
+  return t;
+}
+
+vec3 render(vec3 ro, vec3 rd) {
+  vec3 agg = vec3(0.0);
+  vec3 ragg = vec3(1.0);
+  bool isInside = df(ro) < 0.0;
+
+  for (int bounce = 0; bounce < MAX_BOUNCES; ++bounce) {
+    float dfactor = isInside ? -1.0 : 1.0;
+    float mragg = min(min(ragg.x, ragg.y), ragg.z);
+    if (mragg < 0.025) break;
+    int iter;
+    float st = rayMarch(ro, rd, dfactor, iter);
+    vec3 mat = g_mat;
+    vec3 beer = g_beer;
+    if (st >= MAX_RAY_LENGTH) {
+      agg += ragg*skyColor(ro, rd);
+      break;
+    }
+
+    vec3 sp = ro+rd*st;
+    vec3 sn = dfactor*normal(sp);
+    float fre = 1.0+dot(rd, sn);
+    fre *= fre;
+    fre = mix(0.1, 1.0, fre);
+
+    vec3 ld     = normalize(lightPos - sp);
+    float dif   = max(dot(ld, sn), 0.0);
+    vec3 ref    = reflect(rd, sn);
+    float re    = mat.z;
+    float ire   = 1.0/re;
+    vec3 refr   = refract(rd, sn, !isInside ? re : ire);
+    vec3 rsky   = skyColor(sp, ref);
+    vec3 col = vec3(0.0);
+    col += diffuseCol*dif*dif*(1.0-mat.x);
+    float edge = smoothstep(1.0, 0.9, fre);
+    col += rsky*mat.y*fre*vec3(1.0)*edge;
+    if (isInside) {
+      ragg *= exp(-st*beer);
+    }
+    agg += ragg*col;
+
+    if (refr == vec3(0.0)) {
+      rd = ref;
+    } else {
+      ragg *= mat.x;
+      isInside = !isInside;
+      rd = refr;
+    }
+
+    ro = sp+initt*rd;
+  }
+
+  return agg;
+}
+
+vec3 effect(vec2 p) {
+  g_rot = rot_x(0.2*TIME)*rot_y(0.3*TIME);
+  vec3 ro = 0.6*vec3(0.0, 2.0, 5.0);
+  const vec3 la = vec3(0.0, 0.0, 0.0);
+  const vec3 up = vec3(0.0, 1.0, 0.0);
+
+  vec3 ww = normalize(la - ro);
+  vec3 uu = normalize(cross(up, ww ));
+  vec3 vv = normalize(cross(ww,uu));
+  const float fov = tan(TAU/6.);
+  vec3 rd = normalize(-p.x*uu + p.y*vv + fov*ww);
+
+  return render(ro, rd);
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
+  vec2 q = fragCoord/RESOLUTION.xy;
+  vec2 p = -1. + 2. * q;
+  p.x *= RESOLUTION.x/RESOLUTION.y;
+  // Keep scene-linear HDR — no ACES/sRGB.
+  fragColor = vec4(max(effect(p), vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+
+
+#SHADER(Image)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+#define RESOLUTION      iResolution
+
+vec4 fxaa(sampler2D tex, vec2 uv, vec2 texelSz) {
+  const float span_max    = 8.0;
+  const float reduce_min  = (1.0/128.0);
+  const float reduce_mul  = (1.0/32.0);
+  const vec3  luma        = vec3(0.299, 0.587, 0.114);
+
+  vec3 rgbCC = texture(tex, uv).rgb;
+  vec3 rgb00 = texture(tex, uv+vec2(-0.5,-0.5)*texelSz).rgb;
+  vec3 rgb10 = texture(tex, uv+vec2(+0.5,-0.5)*texelSz).rgb;
+  vec3 rgb01 = texture(tex, uv+vec2(-0.5,+0.5)*texelSz).rgb;
+  vec3 rgb11 = texture(tex, uv+vec2(+0.5,+0.5)*texelSz).rgb;
+
+  float lumaCC = dot(rgbCC, luma);
+  float luma00 = dot(rgb00, luma);
+  float luma10 = dot(rgb10, luma);
+  float luma01 = dot(rgb01, luma);
+  float luma11 = dot(rgb11, luma);
+
+  vec2 dir = vec2((luma01 + luma11) - (luma00 + luma10), (luma00 + luma01) - (luma10 + luma11));
+  float dirReduce = max((luma00 + luma10 + luma01 + luma11) * reduce_mul, reduce_min);
+  float rcpDir = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+  dir = clamp(dir * rcpDir, -span_max, span_max) * texelSz.xy;
+
+  vec4 A = 0.5 * (
+      texture(tex, uv - dir * (1.0/6.0))
+    + texture(tex, uv + dir * (1.0/6.0))
+    );
+
+  vec4 B = A * 0.5 + 0.25 * (
+      texture(tex, uv - dir * (0.3))
+    + texture(tex, uv + dir * (0.3))
+    );
+
+  float lumaMin = min(lumaCC, min(min(luma00, luma10), min(luma01, luma11)));
+  float lumaMax = max(lumaCC, max(max(luma00, luma10), max(luma01, luma11)));
+  float lumaB = dot(B.rgb, luma);
+
+  return ((lumaB < lumaMin) || (lumaB > lumaMax)) ? A : B;
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
+  vec2 q = fragCoord/RESOLUTION.xy;
+  // Buffers are stored with Vulkan top-left texel origin; Shadertoy UVs are bottom-left.
+  vec2 uv = vec2(q.x, 1.0 - q.y);
+  fragColor = fxaa(iChannel0, uv, sqrt(2.0)/RESOLUTION.xy);
+  fragColor.rgb = max(fragColor.rgb, vec3(0.0));
+  fragColor.a = 1.0;
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}

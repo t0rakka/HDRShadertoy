@@ -1,0 +1,112 @@
+#version 450
+
+/*
+    Shader:  Geometry 306
+    Author:  gaz
+    License: 
+*/
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+#define PI 3.14159265
+
+vec3 rot(vec3 p, vec3 a, float t)
+{
+    a = normalize(a);
+    return mix(a * dot(p, a), p, cos(t)) + sin(t) * cross(p, a);
+}
+
+float map(vec3 p)
+{
+    p = rot(p, vec3(1, 0, 0), iTime * 0.07);
+    p = rot(p, vec3(0, 1, 0), iTime * 2.0);
+    p.zx = vec2(atan(p.z, p.x) / PI * 0.2, length(p.zx) - 1.5);
+    p.xy = vec2(atan(p.x, p.y) / PI * 0.5, length(p.xy) - 1.0);
+    p.x += p.z;
+    p.x = mod(p.x, 0.2) - 0.1;
+    vec2 g = vec2(5, 1);
+    return (length(p.xy * g) - 0.3);
+}
+
+vec3 calcNormal(vec3 p)
+{
+    vec3 e = 0.05 * vec3(-1, 1, 1);
+    return normalize(e * map(p + e) + e.yxy * map(p + e.yxy) + e.yyx * map(p + e.yyx) - e.xxx * map(p - e.xxx));
+}
+
+float march(vec3 ro, vec3 rd, float near, float far)
+{
+    float t = near, d;
+    for (int i = 0; i < 100; i++)
+    {
+        t += d = map(ro + rd * t);
+        if (d < 0.001) return t;
+        if (t >= far) return far;
+    }
+    return far;
+}
+
+vec3 doColor(vec3 p)
+{
+    return vec3(0.7, 0.5, 0.3) + cos(p * 2.0) * 0.5 + 0.5;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord)
+{
+    vec2 uv = (fragCoord.xy * 2.0 - iResolution.xy) / iResolution.y;
+    vec3 ro = vec3(0, 0, -6);
+    vec3 rd = normalize(vec3(uv, 3));
+    vec3 col = vec3(0);
+    const float maxd = 50.0;
+    float t = march(ro, rd, 0.0, maxd);
+    if (t < maxd)
+    {
+        vec3 p = ro + rd * t;
+        col = doColor(p);
+        vec3 n = calcNormal(p);
+        vec3 lightPos = ro + vec3(2, 5, 2) * 0.7;
+        vec3 li = lightPos - p;
+        float len = length(li);
+        li /= len;
+        float dif = clamp(dot(n, li), 0.1, 1.0);
+        col *= max(dif, 0.0);
+        float rimd = pow(clamp(1.0 - dot(reflect(-li, n), -rd), 0.0, 1.0), 2.5);
+        float frn = rimd + 2.2 * (1.0 - rimd);
+        col *= frn * 0.8;
+        col *= max(0.5 + 0.5 * n.y, 0.1);
+        col *= exp2(-2.0 * pow(max(0.0, 1.0 - map(p + n * 0.8) / 0.8), 2.0));
+        col += 0.7 * vec3(0.8, 0.6, 0.2) * pow(clamp(dot(reflect(rd, n), li), 0.0, 1.0), 10.0);
+    }
+    // Keep scene-linear HDR — dropped sRGB gamma encode.
+    fragColor.xyz = max(col, vec3(0.0));
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    // Shadertoy fragCoord is bottom-left origin; Vulkan image coords are top-left.
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

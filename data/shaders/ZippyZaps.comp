@@ -41,10 +41,9 @@ void mainImage(out vec4 o, vec2 u)
            + cos(4.0 / exp(dot(o, o) / 1e2) + t) / 3e2;
     }
 
-    // Soft LDR compress (Shadertoy): leaves little headroom above ~2.
-    // Kept for look — swap for linear exposure if you want raw HDR bloom.
-    o = 25.6 / (min(o, 13.0) + 164.0 / o)
-      - dot(u, u) / 250.0;
+    // Original soft LDR tonemap: 25.6 / (min(o,13) + 164/o).
+    // Linear exposure matches the low/mid slope (~25.6/164), highlights stay unbounded.
+    o = max(o * (25.6 / 164.0), vec4(0.0)) - vec4(dot(u, u) / 250.0);
 }
 
 void main()

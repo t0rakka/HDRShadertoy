@@ -58,7 +58,8 @@ void mainImage(out vec4 O, vec2 C)
         O.xyz += 0.03 * abs(cos(d + 0.5 + log2(s) * 0.6)) * exp(-0.3 * i * i * e);
     }
 
-    O.xyz = pow(O.xyz, vec3(1.8, 1.0, 1.2));
+    // Keep scene-linear HDR — dropped channel pow() display grade.
+    O.xyz = max(O.xyz, vec3(0.0));
 }
 
 void main()

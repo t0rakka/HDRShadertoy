@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Quasi Infinite Zoom Voronoi
+    Author:  Shane
+    License: 
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -15,10 +21,6 @@ layout(push_constant) uniform Push
 #define iTime push.time
 #define iResolution vec3(push.resolution, 1.0)
 #define iMouse push.mouse
-
-// Quasi Infinite Zoom Voronoi — Shane
-// https://www.shadertoy.com/view/4sl3RX
-// Inspired by Fabrice Neyret's "Infinite Fall"
 
 vec2 hash22(vec2 p)
 {

@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Zippy Zaps
+    Author:  SnoopethDuckDuck
+    License: 
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -15,9 +21,6 @@ layout(push_constant) uniform Push
 #define iTime push.time
 #define iResolution vec3(push.resolution, 1.0)
 #define iMouse push.mouse
-
-// Zippy Zaps
-// https://www.shadertoy.com/view/ (Nguyen2007 variant)
 
 void mainImage(out vec4 o, vec2 u)
 {
@@ -38,6 +41,8 @@ void mainImage(out vec4 o, vec2 u)
            + cos(4.0 / exp(dot(o, o) / 1e2) + t) / 3e2;
     }
 
+    // Soft LDR compress (Shadertoy): leaves little headroom above ~2.
+    // Kept for look — swap for linear exposure if you want raw HDR bloom.
     o = 25.6 / (min(o, 13.0) + 164.0 / o)
       - dot(u, u) / 250.0;
 }

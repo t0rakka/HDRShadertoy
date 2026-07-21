@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  PBR Mandelbulb with Soft Shadows
+    Author:  dugufly
+    License: 
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -157,11 +163,9 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     
     // 4. 后处理：基于深度的雾化 (Fog)
     col = mix(col, vec3(0.05, 0.08, 0.12), 1.0 - exp(-0.05 * dO * dO));
-    
-    // 5. 电影级 Gamma 校正
-    col = pow(col, vec3(0.4545));
-    
-    fragColor = vec4(col, 1.0);
+
+    // Keep scene-linear HDR — no sRGB gamma encode.
+    fragColor = vec4(max(col, vec3(0.0)), 1.0);
 }
 void main()
 {

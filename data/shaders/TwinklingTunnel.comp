@@ -1,5 +1,11 @@
 #version 450
 
+/*
+    Shader:  Trailing the Twinkling Tunnelwisp
+    Author:  mrange
+    License: CC0
+*/
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
@@ -16,7 +22,6 @@ layout(push_constant) uniform Push
 #define iResolution vec3(push.resolution, 1.0)
 #define iMouse push.mouse
 
-// CC0: Trailing the Twinkling Tunnelwisp
 //  A bit of Saturday coding (also Norway’s Constitution Day).
 //  Some artifacts remain, but it’s good enough for my standards.
 
@@ -68,7 +73,8 @@ void mainImage(out vec4 O, vec2 C)
     }
 
     o += (1.4 + sin(T) * sin(1.7 * T) * sin(2.3 * T)) * 1e3 * U / length(q.xy);
-    O = tanh(o / 1e5);
+    // Keep scene-linear HDR — original tanh() soft-tonemapped to ~[-1,1].
+    O = max(o / 1e5, vec4(0.0));
 }
 
 void main()

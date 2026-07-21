@@ -3,7 +3,8 @@
     Copyright (C) 2012-2026 Twilight Finland 3D Oy Ltd. All rights reserved.
 
     Vulkan Shadertoy compute shader player — Float16 RenderTarget, HDR resolve.
-    Supports single-pass .comp files and multipass effects (#SHADER / #CHANNEL).
+    Supports single-pass .comp files and multipass effects
+    (#SHADER / #CHANNEL / #COMMON, buffer self-feedback, Noise channel).
 */
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -72,11 +74,18 @@ namespace
         return int(id);
     }
 
+    enum class ChannelSourceKind : int
+    {
+        Buffer = 0,
+        Noise = 1,
+    };
+
     struct ChannelBinding
     {
         PassId pass = PassId::Invalid;
         int slot = 0;
-        PassId source = PassId::Invalid;
+        ChannelSourceKind kind = ChannelSourceKind::Buffer;
+        PassId source = PassId::Invalid; // when kind == Buffer
     };
 
     struct EffectPass
@@ -129,15 +138,18 @@ namespace
     };
 
     // Matches layout(push_constant) in every .comp shader.
+    // Existing shaders may call the second float _pad0; newer ones use it as iTimeDelta.
     struct ShadertoyPush
     {
         float time = 0.0f;
-        float pad0 = 0.0f;
+        float timeDelta = 0.0f;
         float32x2 resolution {};
         float32x4 mouse {};
     };
 
     static_assert(sizeof(ShadertoyPush) <= 128, "push constants must fit default limit");
+
+    constexpr u32 kNoiseSize = 1024;
 
     std::string trim(std::string_view s)
     {
@@ -152,7 +164,7 @@ namespace
         return std::string(s);
     }
 
-    std::string stripChannelDirectives(const std::string& source)
+    std::string stripHostDirectives(const std::string& source)
     {
         std::string out;
         out.reserve(source.size());
@@ -167,7 +179,12 @@ namespace
 
             std::string_view line(source.data() + i, lineEnd - i);
             const std::string trimmed = trim(line);
-            if (trimmed.rfind("#CHANNEL", 0) != 0)
+            const bool skip =
+                trimmed.rfind("#CHANNEL", 0) == 0 ||
+                trimmed.rfind("#COMMON", 0) == 0 ||
+                trimmed.rfind("#SHADER", 0) == 0;
+
+            if (!skip)
             {
                 out.append(source, i, lineEnd - i);
                 if (lineEnd < source.size())
@@ -179,6 +196,17 @@ namespace
             i = (lineEnd < source.size()) ? lineEnd + 1 : lineEnd;
         }
         return out;
+    }
+
+    // Back-compat alias used by older call sites during the transition.
+    std::string stripChannelDirectives(const std::string& source)
+    {
+        return stripHostDirectives(source);
+    }
+
+    bool parseNoiseSource(std::string_view s)
+    {
+        return s == "Noise" || s == "noise" || s == "NOISE" || s == "R" || s == "r";
     }
 
     std::vector<ChannelBinding> parseChannelDirectives(const std::string& source)
@@ -209,10 +237,31 @@ namespace
                     {
                         const PassId pass = parsePassId(trim(args.substr(0, c1)));
                         const int slot = std::atoi(trim(args.substr(c1 + 1, c2 - c1 - 1)).c_str());
-                        const PassId sourcePass = parsePassId(trim(args.substr(c2 + 1)));
-                        if (pass != PassId::Invalid && sourcePass != PassId::Invalid && slot >= 0 && slot < kChannelCount)
+                        const std::string sourceToken = trim(args.substr(c2 + 1));
+
+                        ChannelBinding binding;
+                        binding.pass = pass;
+                        binding.slot = slot;
+
+                        if (parseNoiseSource(sourceToken))
                         {
-                            channels.push_back({ pass, slot, sourcePass });
+                            binding.kind = ChannelSourceKind::Noise;
+                            binding.source = PassId::Invalid;
+                        }
+                        else
+                        {
+                            binding.kind = ChannelSourceKind::Buffer;
+                            binding.source = parsePassId(sourceToken);
+                        }
+
+                        const bool okPass = binding.pass != PassId::Invalid && slot >= 0 && slot < kChannelCount;
+                        const bool okSource =
+                            (binding.kind == ChannelSourceKind::Noise) ||
+                            (binding.kind == ChannelSourceKind::Buffer && binding.source != PassId::Invalid);
+
+                        if (okPass && okSource)
+                        {
+                            channels.push_back(binding);
                         }
                         else
                         {
@@ -225,6 +274,86 @@ namespace
             i = (lineEnd < source.size()) ? lineEnd + 1 : lineEnd;
         }
         return channels;
+    }
+
+    std::string parseCommonSection(const std::string& source)
+    {
+        const std::string marker = "#COMMON";
+        size_t pos = 0;
+        while (pos < source.size())
+        {
+            const size_t markerPos = source.find(marker, pos);
+            if (markerPos == std::string::npos)
+            {
+                break;
+            }
+
+            // Require start-of-line (or after newline).
+            if (markerPos > 0 && source[markerPos - 1] != '\n')
+            {
+                pos = markerPos + marker.size();
+                continue;
+            }
+
+            size_t contentStart = markerPos + marker.size();
+            while (contentStart < source.size() && (source[contentStart] == ' ' || source[contentStart] == '\t'))
+            {
+                ++contentStart;
+            }
+            while (contentStart < source.size() && (source[contentStart] == '\r' || source[contentStart] == '\n'))
+            {
+                ++contentStart;
+            }
+
+            const size_t nextShader = source.find("#SHADER", contentStart);
+            const size_t contentEnd = (nextShader == std::string::npos) ? source.size() : nextShader;
+            return stripHostDirectives(source.substr(contentStart, contentEnd - contentStart));
+        }
+        return {};
+    }
+
+    std::string injectCommonAfterVersion(const std::string& section, const std::string& common)
+    {
+        if (common.empty())
+        {
+            return section;
+        }
+
+        // Insert after push-constant / iChannel boilerplate so COMMON can use iResolution macros.
+        const char* anchors[] = {
+            "layout(set = 0, binding = 4) uniform sampler2D iChannel3;",
+            "#define iMouse push.mouse",
+            "#define iResolution",
+        };
+
+        for (const char* anchor : anchors)
+        {
+            const size_t at = section.find(anchor);
+            if (at == std::string::npos)
+            {
+                continue;
+            }
+            const size_t eol = section.find('\n', at);
+            if (eol == std::string::npos)
+            {
+                return section + "\n" + common;
+            }
+            return section.substr(0, eol + 1) + "\n" + common + "\n" + section.substr(eol + 1);
+        }
+
+        const size_t ver = section.find("#version");
+        if (ver == std::string::npos)
+        {
+            return common + "\n" + section;
+        }
+
+        const size_t eol = section.find('\n', ver);
+        if (eol == std::string::npos)
+        {
+            return section + "\n" + common;
+        }
+
+        return section.substr(0, eol + 1) + "\n" + common + "\n" + section.substr(eol + 1);
     }
 
     struct ParsedSection
@@ -273,13 +402,13 @@ namespace
 
             const size_t nextMarker = source.find(marker, contentStart);
             const size_t contentEnd = (nextMarker == std::string::npos) ? source.size() : nextMarker;
-            sections.push_back({ id, stripChannelDirectives(source.substr(contentStart, contentEnd - contentStart)) });
+            sections.push_back({ id, stripHostDirectives(source.substr(contentStart, contentEnd - contentStart)) });
             pos = contentEnd;
         }
 
         if (!found)
         {
-            sections.push_back({ PassId::Image, stripChannelDirectives(source) });
+            sections.push_back({ PassId::Image, stripHostDirectives(source) });
         }
 
         std::sort(sections.begin(), sections.end(), [](const ParsedSection& a, const ParsedSection& b)
@@ -335,6 +464,7 @@ namespace
 
             const std::string source(reinterpret_cast<const char*>(file.data()), size_t(file.size()));
             const std::vector<ChannelBinding> channels = parseChannelDirectives(source);
+            const std::string common = parseCommonSection(source);
             const std::vector<ParsedSection> sections = parseShaderSections(source);
             if (sections.empty())
             {
@@ -349,7 +479,8 @@ namespace
             bool ok = true;
             for (const ParsedSection& section : sections)
             {
-                Shader shader = compiler.compile(section.source, ShaderStage::Compute);
+                const std::string compiledSource = injectCommonAfterVersion(section.source, common);
+                Shader shader = compiler.compile(compiledSource, ShaderStage::Compute);
                 if (!shader)
                 {
                     printLine(Print::Error, "Compute compile failed: {} [{}]", name, passIdName(section.id));
@@ -372,9 +503,11 @@ namespace
 
             if (ok && !effect.passes.empty())
             {
-                if (effect.passes.size() > 1)
+                if (effect.passes.size() > 1 || !common.empty())
                 {
-                    printLine(Print::Info, "  multipass: {} sections", effect.passes.size());
+                    printLine(Print::Info, "  multipass: {} sections{}",
+                        effect.passes.size(),
+                        common.empty() ? "" : " +COMMON");
                 }
                 library.effects.push_back(std::move(effect));
             }
@@ -452,8 +585,16 @@ protected:
 
     std::unique_ptr<Allocator> m_allocator;
     std::unique_ptr<RenderTarget> m_renderTarget;
-    std::array<std::unique_ptr<RenderTarget>, 4> m_buffers {}; // A..D
+    // Per buffer A-D: up to 2 ping-pong targets. [i][0] always allocated when pass exists;
+    // [i][1] allocated when the effect self-feeds that buffer.
+    std::array<std::array<std::unique_ptr<RenderTarget>, 2>, 4> m_buffers {};
+    std::array<int, 4> m_bufferWrite {};
+    std::array<bool, 4> m_bufferFeedback {};
     std::unique_ptr<RenderTarget> m_dummyChannel;
+
+    ImageAllocation m_noiseImage {};
+    VkImageView m_noiseView = VK_NULL_HANDLE;
+    bool m_needsNoise = false;
 
     OutputTransformOptions m_outputOptions {};
     bool m_hdrSwapchain = false;
@@ -465,10 +606,13 @@ protected:
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkSampler m_sampler = VK_NULL_HANDLE;
+    VkSampler m_samplerRepeat = VK_NULL_HANDLE;
 
     std::vector<PassGpu> m_passes;
 
     float m_frameTimeMs = 0.0f;
+    double m_prevTime = -1.0;
+    float m_timeDelta = 1.0f / 60.0f;
     std::string m_statusLine;
 
     float32x4 m_mouse {};
@@ -498,6 +642,7 @@ public:
         printLine("Use LEFT/RIGHT to cycle shaders.");
 
         createComputeResources();
+        createNoiseTexture();
         recreateRenderTargets(swapchainExtent());
         applyEffect(m_effectIndex);
         updateStatusLine();
@@ -519,10 +664,12 @@ public:
             vkDeviceWaitIdle(m_device);
             destroyPassGpu();
             destroyComputeResources();
+            destroyNoiseTexture();
             m_renderTarget.reset();
-            for (auto& buffer : m_buffers)
+            for (auto& pair : m_buffers)
             {
-                buffer.reset();
+                pair[0].reset();
+                pair[1].reset();
             }
             m_dummyChannel.reset();
             m_allocator.reset();
@@ -610,6 +757,11 @@ public:
             .maxLod = 0.0f,
         };
         vkCreateSampler(m_device, &samplerInfo, nullptr, &m_sampler);
+
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        vkCreateSampler(m_device, &samplerInfo, nullptr, &m_samplerRepeat);
     }
 
     void destroyPassGpu()
@@ -647,6 +799,8 @@ public:
         destroyPassGpu();
 
         m_effectIndex = index;
+        m_bufferWrite = {};
+        m_prevTime = -1.0;
         const Effect& effect = m_library.effects[m_effectIndex];
 
         ensureBufferTargets(swapchainExtent());
@@ -742,6 +896,12 @@ public:
             m_sampler = VK_NULL_HANDLE;
         }
 
+        if (m_samplerRepeat != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(m_device, m_samplerRepeat, nullptr);
+            m_samplerRepeat = VK_NULL_HANDLE;
+        }
+
         if (m_descriptorPool != VK_NULL_HANDLE)
         {
             vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
@@ -761,14 +921,41 @@ public:
         }
     }
 
-    RenderTarget* bufferTarget(PassId id) const
+    void refreshFeedbackFlags()
+    {
+        m_bufferFeedback = {};
+        m_needsNoise = false;
+        if (m_library.effects.empty())
+        {
+            return;
+        }
+
+        const Effect& effect = m_library.effects[m_effectIndex];
+        for (const ChannelBinding& binding : effect.channels)
+        {
+            if (binding.kind == ChannelSourceKind::Noise)
+            {
+                m_needsNoise = true;
+            }
+            else if (binding.kind == ChannelSourceKind::Buffer &&
+                     binding.pass == binding.source &&
+                     binding.pass != PassId::Invalid &&
+                     binding.pass != PassId::Image &&
+                     effect.hasPass(binding.pass))
+            {
+                m_bufferFeedback[size_t(binding.pass)] = true;
+            }
+        }
+    }
+
+    RenderTarget* bufferTarget(PassId id, int ping) const
     {
         const int index = int(id);
-        if (index < 0 || index >= 4)
+        if (index < 0 || index >= 4 || ping < 0 || ping > 1)
         {
             return nullptr;
         }
-        return m_buffers[size_t(index)].get();
+        return m_buffers[size_t(index)][size_t(ping)].get();
     }
 
     RenderTarget* passTarget(PassId id) const
@@ -777,29 +964,80 @@ public:
         {
             return m_renderTarget.get();
         }
-        return bufferTarget(id);
+        const int index = int(id);
+        if (index < 0 || index >= 4)
+        {
+            return nullptr;
+        }
+        return bufferTarget(id, m_bufferWrite[size_t(index)]);
     }
 
-    VkImageView channelView(PassId source) const
+    VkImageView bufferChannelView(PassId source, PassId consumer) const
     {
-        RenderTarget* rt = passTarget(source);
+        const int index = int(source);
+        if (index < 0 || index >= 4)
+        {
+            return VK_NULL_HANDLE;
+        }
+
+        int ping = m_bufferWrite[size_t(index)];
+        // Self-feedback reads the previous frame (other ping-pong slot).
+        if (source == consumer && m_bufferFeedback[size_t(index)])
+        {
+            ping = 1 - ping;
+        }
+
+        RenderTarget* rt = bufferTarget(source, ping);
         if (rt && *rt)
         {
             return rt->view();
         }
+        return VK_NULL_HANDLE;
+    }
+
+    VkImageView channelView(const ChannelBinding* binding, PassId consumer) const
+    {
+        if (!binding)
+        {
+            return m_dummyChannel && *m_dummyChannel ? m_dummyChannel->view() : VK_NULL_HANDLE;
+        }
+
+        if (binding->kind == ChannelSourceKind::Noise)
+        {
+            if (m_noiseView != VK_NULL_HANDLE)
+            {
+                return m_noiseView;
+            }
+            return m_dummyChannel && *m_dummyChannel ? m_dummyChannel->view() : VK_NULL_HANDLE;
+        }
+
+        if (binding->source == PassId::Image)
+        {
+            if (m_renderTarget && *m_renderTarget)
+            {
+                return m_renderTarget->view();
+            }
+            return VK_NULL_HANDLE;
+        }
+
+        const VkImageView view = bufferChannelView(binding->source, consumer);
+        if (view != VK_NULL_HANDLE)
+        {
+            return view;
+        }
         return m_dummyChannel && *m_dummyChannel ? m_dummyChannel->view() : VK_NULL_HANDLE;
     }
 
-    PassId channelSource(const Effect& effect, PassId pass, int slot) const
+    const ChannelBinding* findChannelBinding(const Effect& effect, PassId pass, int slot) const
     {
         for (const ChannelBinding& binding : effect.channels)
         {
             if (binding.pass == pass && binding.slot == slot)
             {
-                return binding.source;
+                return &binding;
             }
         }
-        return PassId::Invalid;
+        return nullptr;
     }
 
     void updatePassDescriptors()
@@ -844,21 +1082,15 @@ public:
 
             for (int slot = 0; slot < kChannelCount; ++slot)
             {
-                const PassId source = channelSource(effect, pass.id, slot);
-                VkImageView view = m_dummyChannel->view();
-                if (source != PassId::Invalid)
-                {
-                    const VkImageView srcView = channelView(source);
-                    if (srcView != VK_NULL_HANDLE)
-                    {
-                        view = srcView;
-                    }
-                }
+                const ChannelBinding* binding = findChannelBinding(effect, pass.id, slot);
+                const VkImageView view = channelView(binding, pass.id);
+                const bool repeat = binding && binding->kind == ChannelSourceKind::Noise;
 
                 channelInfos[size_t(slot)] = {
-                    .sampler = m_sampler,
-                    .imageView = view,
+                    .sampler = repeat ? m_samplerRepeat : m_sampler,
+                    .imageView = view != VK_NULL_HANDLE ? view : m_dummyChannel->view(),
                     // GENERAL is valid for sampling and matches RenderTarget compute path.
+                    // Noise is transitioned to GENERAL after upload for the same reason.
                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 };
 
@@ -896,20 +1128,208 @@ public:
             return;
         }
 
+        refreshFeedbackFlags();
+
         const Effect& effect = m_library.effects[m_effectIndex];
         for (int i = 0; i < 4; ++i)
         {
             const PassId id = PassId(i);
-            if (effect.hasPass(id))
+            if (!effect.hasPass(id))
             {
-                if (!m_buffers[size_t(i)] || !(*m_buffers[size_t(i)]) ||
-                    m_buffers[size_t(i)]->extent().width != extent.width ||
-                    m_buffers[size_t(i)]->extent().height != extent.height)
+                m_buffers[size_t(i)][0].reset();
+                m_buffers[size_t(i)][1].reset();
+                m_bufferWrite[size_t(i)] = 0;
+                continue;
+            }
+
+            auto needsResize = [&](const std::unique_ptr<RenderTarget>& rt) -> bool
+            {
+                return !rt || !(*rt) ||
+                    rt->extent().width != extent.width ||
+                    rt->extent().height != extent.height;
+            };
+
+            if (needsResize(m_buffers[size_t(i)][0]))
+            {
+                m_buffers[size_t(i)][0] = makeFloat16Target(extent);
+                m_bufferWrite[size_t(i)] = 0;
+            }
+
+            if (m_bufferFeedback[size_t(i)])
+            {
+                if (needsResize(m_buffers[size_t(i)][1]))
                 {
-                    m_buffers[size_t(i)] = makeFloat16Target(extent);
+                    m_buffers[size_t(i)][1] = makeFloat16Target(extent);
+                    m_bufferWrite[size_t(i)] = 0;
                 }
             }
+            else
+            {
+                m_buffers[size_t(i)][1].reset();
+                m_bufferWrite[size_t(i)] = 0;
+            }
         }
+    }
+
+    void destroyNoiseTexture()
+    {
+        if (m_noiseView != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(m_device, m_noiseView, nullptr);
+            m_noiseView = VK_NULL_HANDLE;
+        }
+        if (m_noiseImage && m_allocator)
+        {
+            m_allocator->destroyImage(m_noiseImage);
+            m_noiseImage = {};
+        }
+    }
+
+    void createNoiseTexture()
+    {
+        destroyNoiseTexture();
+        if (!m_allocator)
+        {
+            return;
+        }
+
+        VkImageCreateInfo imageInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .extent = { kNoiseSize, kNoiseSize, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+
+        m_noiseImage = m_allocator->createImage(imageInfo, MemoryUsage::GpuOnly);
+        if (!m_noiseImage)
+        {
+            printLine(Print::Error, "Failed to create noise image");
+            return;
+        }
+
+        VkImageViewCreateInfo viewInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = m_noiseImage.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+
+        if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_noiseView) != VK_SUCCESS)
+        {
+            printLine(Print::Error, "Failed to create noise image view");
+            destroyNoiseTexture();
+            return;
+        }
+
+        const VkDeviceSize byteSize = VkDeviceSize(kNoiseSize) * kNoiseSize * 4;
+        BufferAllocation staging = m_allocator->createBuffer(
+            byteSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload, true);
+        if (!staging || !staging.mapped)
+        {
+            printLine(Print::Error, "Failed to create noise staging buffer");
+            destroyNoiseTexture();
+            return;
+        }
+
+        std::mt19937 rng(0xC0FFEEu);
+        std::uniform_int_distribution<int> dist(0, 255);
+        u8* pixels = static_cast<u8*>(staging.mapped);
+        for (VkDeviceSize i = 0; i < byteSize; ++i)
+        {
+            pixels[i] = u8(dist(rng));
+        }
+        m_allocator->flush(staging.allocation, 0, byteSize);
+
+        VkCommandPoolCreateInfo poolInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = m_graphicsQueueFamilyIndex,
+        };
+        VkCommandPool pool = VK_NULL_HANDLE;
+        vkCreateCommandPool(m_device, &poolInfo, nullptr, &pool);
+
+        VkCommandBufferAllocateInfo allocInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+
+        VkCommandBufferBeginInfo beginInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkImageMemoryBarrier toDst = makeImageBarrier(
+            m_noiseImage.image,
+            0,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkBufferImageCopy region =
+        {
+            .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1,
+            },
+            .imageExtent = { kNoiseSize, kNoiseSize, 1 },
+        };
+        vkCmdCopyBufferToImage(cmd, staging.buffer, m_noiseImage.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        VkImageMemoryBarrier toGeneral = makeImageBarrier(
+            m_noiseImage.image,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo submitInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(m_graphicsQueue);
+
+        vkDestroyCommandPool(m_device, pool, nullptr);
+        m_allocator->destroyBuffer(staging);
+
+        printLine(Print::Info, "Noise texture: {}x{} RGBA8", kNoiseSize, kNoiseSize);
     }
 
     void recreateRenderTargets(VkExtent2D extent)
@@ -948,9 +1368,21 @@ public:
     {
         ShadertoyPush push {};
         push.time = float(time);
+        push.timeDelta = m_timeDelta;
         push.resolution = float32x2(float(extent.width), float(extent.height));
         push.mouse = m_mouse;
         return push;
+    }
+
+    void flipFeedbackBuffers()
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            if (m_bufferFeedback[size_t(i)])
+            {
+                m_bufferWrite[size_t(i)] = 1 - m_bufferWrite[size_t(i)];
+            }
+        }
     }
 
     void dispatchPass(VkCommandBuffer cmd, const PassGpu& pass, const VkExtent2D& extent, double time)
@@ -984,6 +1416,9 @@ public:
             return;
         }
 
+        // Ping-pong write indices change every frame; refresh descriptors before dispatch.
+        updatePassDescriptors();
+
         for (size_t i = 0; i < m_passes.size(); ++i)
         {
             const PassGpu& pass = m_passes[i];
@@ -1009,6 +1444,9 @@ public:
                 }
             }
         }
+
+        // Flip after all same-frame consumers have sampled the just-written feedback buffers.
+        flipFeedbackBuffers();
     }
 
     void recordCommandBuffer(VkCommandBuffer cmd, u32 imageIndex, const VkExtent2D& extent, double time)
@@ -1062,6 +1500,16 @@ public:
     void onFrame(const FrameInfo& info) override
     {
         m_frameTimeMs = float(info.dt * 1000.0);
+        if (m_prevTime < 0.0)
+        {
+            m_timeDelta = float(std::max(info.dt, 1e-4));
+        }
+        else
+        {
+            m_timeDelta = float(std::max(info.time - m_prevTime, 1e-4));
+        }
+        m_prevTime = info.time;
+
         const float fps = 1000.0f / std::max(m_frameTimeMs, 0.001f);
         setTitle(fmt::format("{}  {:.1f} fps", m_statusLine, fps));
         render(info.time);

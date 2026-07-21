@@ -1,0 +1,579 @@
+/*
+    Shader:  Volumetric GI (multipass)
+    Author:  Shadertoy port (CC0-style GI / DoF / fog stack)
+    Notes:   Buffer A = previous B; Buffer C self-feedback; D uses Noise.
+*/
+
+#CHANNEL(A, 0, B)
+#CHANNEL(C, 0, C)
+#CHANNEL(C, 1, B)
+#CHANNEL(C, 2, A)
+#CHANNEL(D, 0, C)
+#CHANNEL(D, 1, B)
+#CHANNEL(D, 2, Noise)
+#CHANNEL(Image, 0, D)
+
+#COMMON
+
+//increase this number for a better GI
+#define IndirectSamples 1
+
+//increase to remove more noise, but might make the result blurrier
+#define SamplesLimit 150
+
+//GI bounces
+#define Bounces 1
+
+#define PixelAcceptance 1.5
+#define PixelCheckDistance .5
+
+#define Pi 3.14159265359
+
+#define MaxStepsDirect 128
+#define MaxStepsIndirect 32
+#define MaxShadowSteps 32
+#define FogSteps 8
+
+#define MaxDist 4.
+#define MinDist .015
+
+#define DoFClamping .3
+#define DoFSamples 128
+#define MaxDoFRadius 24
+
+#define Density vec3(.0025, .0045, .006)
+#define Anisotropy .4
+#define FogRange 13.
+
+vec3 LightDir = normalize(vec3(.0, .0, -1));
+vec3 LightColor = vec3(1.) * 6.;
+float LightRadius = .02;
+
+struct Camera {
+    vec3 pos, rot;
+    float focalLength, focalDistance, aperture;
+};
+
+// Shadertoy fragCoord (bottom-left) -> Vulkan texel (top-left storage).
+ivec2 stTexel(vec2 fragCoord) {
+    return ivec2(fragCoord.x, iResolution.y - fragCoord.y);
+}
+
+// Shadertoy fragCoord -> Vulkan UV for texture().
+vec2 stUv(vec2 fragCoord) {
+    vec2 q = fragCoord / iResolution.xy;
+    return vec2(q.x, 1.0 - q.y);
+}
+
+mat3 rotationMatrix(vec3 rotEuler){
+    float c = cos(rotEuler.x), s = sin(rotEuler.x);
+    mat3 rx = mat3(1, 0, 0, 0, c, -s, 0, s, c);
+    c = cos(rotEuler.y), s = sin(rotEuler.y);
+    mat3 ry = mat3(c, 0, -s, 0, 1, 0, s, 0, c);
+    c = cos(rotEuler.z), s = sin(rotEuler.z);
+    mat3 rz = mat3(c, -s, 0, s, c, 0, 0, 0, 1);
+    return rz * rx * ry;
+}
+
+Camera getCam(float time){
+    vec3 rot = vec3(cos(time*.4)/6., 1. + time*.2 + sin(time*.2)/4., .5);
+    return Camera(vec3(0., 0., -10.) * rotationMatrix(rot), rot, 1., 7.5, .025);
+}
+
+vec3 uv2dir(Camera cam, vec2 uv){
+    return normalize(vec3(uv, cam.focalLength)) * rotationMatrix(cam.rot);
+}
+
+vec2 pos2uv(Camera cam, vec3 pos){
+    vec3 dir = normalize(pos - cam.pos) * inverse(rotationMatrix(cam.rot));
+    return dir.xy * cam.focalLength / dir.z;
+}
+
+vec3 dirFromUv(Camera cam, vec2 uv){
+    return normalize(vec3(uv, cam.focalLength)) * rotationMatrix(cam.rot);
+}
+
+float sdf(vec3 position, out vec3 diffuseColor, out vec3 emissionColor){
+    diffuseColor = vec3(1.);
+    emissionColor = vec3(0.);
+    float Scale = 2.25;
+    float Radius = .25;
+    mat3 Rotation;
+
+    float time = 15.;
+
+    Rotation = rotationMatrix(vec3(time, time*.7, time*.4)*.2);
+    Scale += sin(time*.5)*.25;
+    Radius += cos(time) *.25;
+
+    vec4 scalevec = vec4(Scale, Scale, Scale, abs(Scale)) / Radius;
+    float C1 = abs(Scale-1.0), C2 = pow(abs(Scale), float(1- /*iterations*/7));
+    vec4 p = vec4(position.xyz*Rotation, 1.0), p0 = p;
+    for (int i = 0; i<7; i++) {
+        p.xyz = clamp(p.xyz, -1.0, 1.0) * 2.0 - p.xyz;
+        p.xyzw *= clamp(max(Radius/dot(p.xyz, p.xyz), Radius), 0.0, 1.0);
+        if(i < 3) p.xyz *= Rotation;
+        p.xyzw = p*scalevec + p0;
+    }
+    return (length(p.xyz) - C1) / p.w - C2;
+}
+
+float sdf(vec3 position){
+    vec3 dc, ec;
+    return sdf(position, dc, ec);
+}
+
+vec3 normalEstimation(vec3 pos){
+  vec2 k = vec2(MinDist, 0);
+  return normalize(vec3(sdf(pos + k.xyy) - sdf(pos - k.xyy),
+                        sdf(pos + k.yxy) - sdf(pos - k.yxy),
+                        sdf(pos + k.yyx) - sdf(pos - k.yyx)));
+}
+
+float henyeyGreenstein(vec3 dirI, vec3 dirO){
+    float cosTheta = dot(dirI, dirO);
+    return Pi/4.0 * (1.0-Anisotropy*Anisotropy) / pow(1.0 + Anisotropy*Anisotropy - 2.0*Anisotropy*cosTheta, 3.0/2.0);
+}
+
+vec3 directLight(vec3 pos, vec3 normal){
+    float dotLight = -dot(normal, LightDir);
+    if(dotLight < 0.0) return vec3(0);
+    vec3 pos0 = pos;
+    float minAngle = LightRadius;
+    for(int i = 0; i < MaxShadowSteps; i++){
+        float dist = sdf(pos);
+        if(dist > MaxDist) break;
+        if(dist < MinDist) return vec3(0.0);
+        pos -= LightDir * dist * 2.5;
+        minAngle = min(asin(dist/length(pos-pos0)), minAngle);
+    }
+    return LightColor * dotLight * clamp(minAngle/LightRadius, .0, 1.0);
+}
+
+#SHADER(A)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float timeDelta;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iTimeDelta push.timeDelta
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord){
+    fragColor = texelFetch(iChannel0, stTexel(fragCoord), 0);
+}
+
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+
+#SHADER(B)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float timeDelta;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iTimeDelta push.timeDelta
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+
+bool trace(inout vec3 pos, in vec3 dir){
+    pos += dir*sdf(pos);
+    pos += dir*sdf(pos);
+    for(int i = 0; i < MaxStepsDirect; i++){
+        float dist = sdf(pos);
+        if(dist > MaxDist) break;
+        if(dist < MinDist){
+            pos -= (2.*MinDist-dist) * dir;
+            pos -= (2.*MinDist-sdf(pos)) * dir;
+            pos -= (2.*MinDist-sdf(pos)) * dir;
+            return true;
+        }
+        pos += dir*dist;
+    }
+    return false;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord){
+    Camera cam = getCam(iTime);
+    vec2 uv = (fragCoord-iResolution.xy/2.0) / iResolution.y;
+    vec3 dir = uv2dir(cam, uv);
+    fragColor = vec4(0.);
+    vec3 pos = cam.pos;
+    if(trace(pos, dir)) fragColor = vec4(pos, 1.);
+}
+
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+
+#SHADER(C)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float timeDelta;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iTimeDelta push.timeDelta
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+
+float seed;
+
+float randomFloat(){
+    return fract(sin(seed++)*43758.54536156);
+}
+
+vec3 ortho(vec3 v) {
+  return abs(v.x) > abs(v.z) ? vec3(-v.y, v.x, 0.0)  : vec3(0.0, -v.z, v.y);
+}
+
+vec3 getCosineWeightedSample(vec3 dir) {
+    vec3 o1 = normalize(ortho(dir));
+    vec3 o2 = normalize(cross(dir, o1));
+    vec2 r = vec2(randomFloat(), randomFloat());
+    r.x = r.x * 2.0 * Pi;
+    r.y = pow(r.y, .5);
+    float oneminus = sqrt(1.0-r.y*r.y);
+    return cos(r.x) * oneminus * o1 + sin(r.x) * oneminus * o2 + r.y * dir;
+}
+
+vec3 background(vec3 dir){
+    return LightColor * Density * 8. * henyeyGreenstein(-LightDir, dir);
+}
+
+vec3 directBackground(vec3 dir){
+    return LightColor * Density * 1.;
+}
+
+bool trace(inout vec3 pos, in vec3 dir, out vec3 normal){
+    for(int i = 0; i < MaxStepsIndirect; i++){
+        float dist = sdf(pos);
+        if(dist > MaxDist) break;
+        if(dist < MinDist){
+            normal = normalEstimation(pos);
+            pos -= (2.*MinDist-dist) * dir;
+            return true;
+        }
+        pos += dir*dist;
+    }
+    return false;
+}
+
+vec3 sampleIndirectLight(vec3 pos, vec3 normal){
+    vec3 dir;
+    vec3 abso = vec3(1.), light = vec3(0.), dc, ec;
+    for(int i = 0; i < Bounces; i++){
+        dir = getCosineWeightedSample(normal);
+        if(!trace(pos, dir, normal)) return light + abso*background(dir);
+        sdf(pos, dc, ec);
+        light += abso * (ec + dc*directLight(pos, normal));
+        abso *= dc;
+    }
+    return light;
+}
+
+float distancePixel(vec2 prevFragCoord, vec4 hit){
+    if(  min(iResolution.xy, prevFragCoord) != prevFragCoord
+      && max(vec2(0.)      , prevFragCoord) != prevFragCoord) return MaxDist;
+    vec4 prevPos = texture(iChannel2, stUv(prevFragCoord));
+    return length(prevPos-hit);
+}
+
+vec4 previousSample(vec4 hit){
+    vec2 prevUv = pos2uv(getCam(iTime-iTimeDelta), hit.xyz);
+    vec2 prevFragCoord = prevUv * iResolution.y + iResolution.xy/2.0;
+
+    vec2 pfc, finalpfc;
+    float dist, finaldist = MaxDist;
+    for(int x = -1; x <= 1; x++){
+        for(int y = -1; y <= 1; y++){
+            pfc = prevFragCoord + PixelCheckDistance*vec2(x, y);
+            dist = distancePixel(pfc, hit);
+            if(dist < finaldist){
+                finalpfc = pfc;
+                finaldist = dist;
+            }
+        }
+    }
+
+    Camera cam = getCam(iTime);
+    if(finaldist < PixelAcceptance*length(hit.xyz-cam.pos)/cam.focalLength/iResolution.y)
+        return texture(iChannel0, stUv(finalpfc));
+    return vec4(0.);
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord){
+    seed = .256435865*fragCoord.x+.316548465*fragCoord.y+sin(iTime)*16886.3158915;
+
+    Camera cam = getCam(iTime);
+
+    vec4 hit = texelFetch(iChannel1, stTexel(fragCoord), 0);
+    if(hit.a == 0.){
+        vec2 uv = (fragCoord-iResolution.xy/2.0) / iResolution.y;
+        fragColor = vec4(directBackground(uv2dir(cam, uv)), 1.);
+    } else {
+        vec3 normal = normalEstimation(hit.xyz);
+
+        vec3 iLight = vec3(0.);
+        for(int i = 0; i < IndirectSamples; i++)
+            iLight += sampleIndirectLight(hit.xyz, normal)/float(IndirectSamples);
+
+        fragColor = previousSample(hit);
+        fragColor.a += fragColor.a > float(SamplesLimit) ? 0. : float(IndirectSamples);
+        iLight = clamp(iLight, vec3(.0), vec3(fragColor.a/10.));
+        fragColor.rgb = mix(fragColor.rgb, iLight, 1.0/(fragColor.a/float(IndirectSamples)));
+    }
+}
+
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+
+#SHADER(D)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float timeDelta;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iTimeDelta push.timeDelta
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord ){
+    Camera cam = getCam(iTime);
+
+    vec4 col = texelFetch(iChannel0, stTexel(fragCoord), 0);
+    vec4 tx = texelFetch(iChannel1, stTexel(fragCoord), 0);
+    vec3 finalPos = tx.rgb;
+    col.a = length(cam.pos-finalPos);
+
+    vec2 uv = (fragCoord-iResolution.xy/2.0) / iResolution.y;
+    vec3 dir = uv2dir(cam, uv);
+
+    if(tx.a != 0.) {
+        vec3 dc, ec;
+        sdf(finalPos, dc, ec);
+        col.rgb = ec + dc * (col.rgb + directLight(finalPos, normalEstimation(finalPos)));
+    } else {
+        finalPos = cam.pos + dir * 100.;
+    }
+
+    vec3 volCol = vec3(0.), volAbs = vec3(1.), pos = cam.pos;
+    float stepDist = (tx.a == 0. ? FogRange : min(FogRange, col.a))/float(FogSteps);
+    vec3 stepAbs = exp(-Density*stepDist);
+    vec3 stepCol = (vec3(1.) - stepAbs) * henyeyGreenstein(-LightDir, dir);
+    // iChannel2 = 1024^2 noise (repeat sampler)
+    pos += stepDist * dir * texture(iChannel2, fragCoord/vec2(1024.0)).a;
+    for(int i = 0; i < FogSteps; i++){
+        volAbs *= stepAbs;
+        volCol += stepCol*volAbs*directLight(pos, -LightDir);
+        pos += dir * stepDist;
+    }
+
+    col.rgb = col.rgb*volAbs + volCol;
+    fragColor = col;
+}
+
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+
+#SHADER(Image)
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float timeDelta;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iTimeDelta push.timeDelta
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+layout(set = 0, binding = 2) uniform sampler2D iChannel1;
+layout(set = 0, binding = 3) uniform sampler2D iChannel2;
+layout(set = 0, binding = 4) uniform sampler2D iChannel3;
+
+
+mat3 gaussianFilter = mat3(41, 26, 7,
+                           26, 16, 4,
+                           7,  4,  1) / 273.;
+
+vec3 bloom(float scale, float threshold, vec2 fragCoord){
+    // No mips on buffer targets — sample base level with scaled offsets.
+    vec3 bloomCol = vec3(0);
+    for(int y = -2; y <= 2; y++)
+        for(int x = -2; x <= 2; x++)
+            bloomCol += gaussianFilter[abs(x)][abs(y)] * texture(iChannel0, stUv(fragCoord+vec2(x, y)*scale)).rgb;
+    return max(bloomCol - vec3(threshold), vec3(0));
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord ){
+    Camera cam = getCam(iTime);
+
+    vec4 col = vec4(0.);
+    float frd = iResolution.y*cam.aperture*DoFClamping;
+    int rd = int(ceil(frd - .5));
+    rd = min(rd, MaxDoFRadius);
+
+    // Fixed bounds for MoltenVK / SPIR-V loop friendliness.
+    for(int y = -MaxDoFRadius; y <= MaxDoFRadius; y++){
+        if (abs(y) > rd) continue;
+        int ln = int(ceil(sqrt(max(frd*frd-float(y*y), 0.0)) - .5));
+        for(int x = -MaxDoFRadius; x <= MaxDoFRadius; x++){
+            if (abs(x) > ln) continue;
+            vec4 p = texelFetch(iChannel0, stTexel(clamp(fragCoord + vec2(x, y), vec2(0), iResolution.xy-1.)), 0);
+            float dof = min(abs(p.a-cam.focalDistance)/max(p.a, 1e-4), DoFClamping) * iResolution.y*cam.aperture;
+            p.a = 1.;
+            p *= clamp((dof - length(vec2(x, y))) + .5, 0.0, 1.0) / (dof*dof+.5);
+            col += p;
+        }
+    }
+
+    col /= max(col.a, 1e-4);
+
+    vec3 bloomSum = vec3(0.);
+    bloomSum += bloom(.07 * iResolution.y, .0, fragCoord) * .06;
+
+    // Scene-linear HDR — no ACES.
+    fragColor = vec4(max(col.rgb + bloomSum, vec3(0.0)), 1.);
+}
+
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, fragColor.a));
+}
+

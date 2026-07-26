@@ -4,7 +4,7 @@
 
     Vulkan Shadertoy compute shader player — Float16 RenderTarget, HDR resolve.
     Supports single-pass .comp files and multipass effects
-    (#SHADER / #CHANNEL / #COMMON, buffer self-feedback, Noise channel).
+    (#SHADER / #CHANNEL / #COMMON, buffer self-feedback, Noise / file textures).
 */
 #include <algorithm>
 #include <array>
@@ -16,12 +16,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #define MANGO_IMPLEMENT_MAIN
 
 #include <mango/core/core.hpp>
 #include <mango/filesystem/filesystem.hpp>
+#include <mango/image/image.hpp>
 #include <mango/math/math.hpp>
 #include <mango/vulkan/vulkan.hpp>
 
@@ -29,6 +31,7 @@ using namespace mango;
 using namespace mango::math;
 using namespace mango::filesystem;
 using namespace mango::vulkan;
+using namespace mango::image;
 
 namespace
 {
@@ -78,6 +81,7 @@ namespace
     {
         Buffer = 0,
         Noise = 1,
+        Texture = 2, // file under data/, e.g. textures/wood.png
     };
 
     struct ChannelBinding
@@ -86,6 +90,7 @@ namespace
         int slot = 0;
         ChannelSourceKind kind = ChannelSourceKind::Buffer;
         PassId source = PassId::Invalid; // when kind == Buffer
+        std::string texturePath;         // when kind == Texture (relative to data/)
     };
 
     struct EffectPass
@@ -209,6 +214,27 @@ namespace
         return s == "Noise" || s == "noise" || s == "NOISE" || s == "R" || s == "r";
     }
 
+    std::string stripQuotes(std::string s)
+    {
+        if (s.size() >= 2)
+        {
+            const char a = s.front();
+            const char b = s.back();
+            if ((a == '"' && b == '"') || (a == '\'' && b == '\''))
+            {
+                return s.substr(1, s.size() - 2);
+            }
+        }
+        return s;
+    }
+
+    bool looksLikeTexturePath(std::string_view s)
+    {
+        return s.find('.') != std::string_view::npos ||
+               s.find('/') != std::string_view::npos ||
+               s.find('\\') != std::string_view::npos;
+    }
+
     std::vector<ChannelBinding> parseChannelDirectives(const std::string& source)
     {
         std::vector<ChannelBinding> channels;
@@ -237,28 +263,38 @@ namespace
                     {
                         const PassId pass = parsePassId(trim(args.substr(0, c1)));
                         const int slot = std::atoi(trim(args.substr(c1 + 1, c2 - c1 - 1)).c_str());
-                        const std::string sourceToken = trim(args.substr(c2 + 1));
+                        const std::string sourceToken = stripQuotes(trim(args.substr(c2 + 1)));
 
                         ChannelBinding binding;
                         binding.pass = pass;
                         binding.slot = slot;
 
+                        bool okSource = false;
                         if (parseNoiseSource(sourceToken))
                         {
                             binding.kind = ChannelSourceKind::Noise;
                             binding.source = PassId::Invalid;
+                            okSource = true;
                         }
                         else
                         {
-                            binding.kind = ChannelSourceKind::Buffer;
-                            binding.source = parsePassId(sourceToken);
+                            const PassId bufferSource = parsePassId(sourceToken);
+                            if (bufferSource != PassId::Invalid)
+                            {
+                                binding.kind = ChannelSourceKind::Buffer;
+                                binding.source = bufferSource;
+                                okSource = true;
+                            }
+                            else if (looksLikeTexturePath(sourceToken))
+                            {
+                                binding.kind = ChannelSourceKind::Texture;
+                                binding.source = PassId::Invalid;
+                                binding.texturePath = sourceToken;
+                                okSource = true;
+                            }
                         }
 
                         const bool okPass = binding.pass != PassId::Invalid && slot >= 0 && slot < kChannelCount;
-                        const bool okSource =
-                            (binding.kind == ChannelSourceKind::Noise) ||
-                            (binding.kind == ChannelSourceKind::Buffer && binding.source != PassId::Invalid);
-
                         if (okPass && okSource)
                         {
                             channels.push_back(binding);
@@ -596,6 +632,15 @@ protected:
     VkImageView m_noiseView = VK_NULL_HANDLE;
     bool m_needsNoise = false;
 
+    struct FileTexture
+    {
+        ImageAllocation image {};
+        VkImageView view = VK_NULL_HANDLE;
+        u32 width = 0;
+        u32 height = 0;
+    };
+    std::unordered_map<std::string, FileTexture> m_fileTextures;
+
     OutputTransformOptions m_outputOptions {};
     bool m_hdrSwapchain = false;
 
@@ -643,6 +688,7 @@ public:
 
         createComputeResources();
         createNoiseTexture();
+        loadFileTextures();
         recreateRenderTargets(swapchainExtent());
         applyEffect(m_effectIndex);
         updateStatusLine();
@@ -665,6 +711,7 @@ public:
             destroyPassGpu();
             destroyComputeResources();
             destroyNoiseTexture();
+            destroyFileTextures();
             m_renderTarget.reset();
             for (auto& pair : m_buffers)
             {
@@ -1011,6 +1058,16 @@ public:
             return m_dummyChannel && *m_dummyChannel ? m_dummyChannel->view() : VK_NULL_HANDLE;
         }
 
+        if (binding->kind == ChannelSourceKind::Texture)
+        {
+            const auto it = m_fileTextures.find(binding->texturePath);
+            if (it != m_fileTextures.end() && it->second.view != VK_NULL_HANDLE)
+            {
+                return it->second.view;
+            }
+            return m_dummyChannel && *m_dummyChannel ? m_dummyChannel->view() : VK_NULL_HANDLE;
+        }
+
         if (binding->source == PassId::Image)
         {
             if (m_renderTarget && *m_renderTarget)
@@ -1084,13 +1141,15 @@ public:
             {
                 const ChannelBinding* binding = findChannelBinding(effect, pass.id, slot);
                 const VkImageView view = channelView(binding, pass.id);
-                const bool repeat = binding && binding->kind == ChannelSourceKind::Noise;
+                const bool repeat = binding &&
+                    (binding->kind == ChannelSourceKind::Noise ||
+                     binding->kind == ChannelSourceKind::Texture);
 
                 channelInfos[size_t(slot)] = {
                     .sampler = repeat ? m_samplerRepeat : m_sampler,
                     .imageView = view != VK_NULL_HANDLE ? view : m_dummyChannel->view(),
                     // GENERAL is valid for sampling and matches RenderTarget compute path.
-                    // Noise is transitioned to GENERAL after upload for the same reason.
+                    // Noise / file textures are transitioned to GENERAL after upload for the same reason.
                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 };
 
@@ -1330,6 +1389,255 @@ public:
         m_allocator->destroyBuffer(staging);
 
         printLine(Print::Info, "Noise texture: {}x{} RGBA8", kNoiseSize, kNoiseSize);
+    }
+
+    void destroyFileTextures()
+    {
+        for (auto& entry : m_fileTextures)
+        {
+            FileTexture& tex = entry.second;
+            if (tex.view != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(m_device, tex.view, nullptr);
+                tex.view = VK_NULL_HANDLE;
+            }
+            if (tex.image && m_allocator)
+            {
+                m_allocator->destroyImage(tex.image);
+                tex.image = {};
+            }
+        }
+        m_fileTextures.clear();
+    }
+
+    bool uploadRgba8Image(ImageAllocation& image, VkImageView& view, VkFormat format,
+                          u32 width, u32 height, const void* pixels, VkDeviceSize byteSize)
+    {
+        if (!m_allocator || !pixels || width == 0 || height == 0)
+        {
+            return false;
+        }
+
+        VkImageCreateInfo imageInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { width, height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+
+        image = m_allocator->createImage(imageInfo, MemoryUsage::GpuOnly);
+        if (!image)
+        {
+            printLine(Print::Error, "Failed to create texture image");
+            return false;
+        }
+
+        VkImageViewCreateInfo viewInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = image.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+
+        if (vkCreateImageView(m_device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+        {
+            printLine(Print::Error, "Failed to create texture image view");
+            m_allocator->destroyImage(image);
+            image = {};
+            return false;
+        }
+
+        BufferAllocation staging = m_allocator->createBuffer(
+            byteSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload, true);
+        if (!staging || !staging.mapped)
+        {
+            printLine(Print::Error, "Failed to create texture staging buffer");
+            vkDestroyImageView(m_device, view, nullptr);
+            view = VK_NULL_HANDLE;
+            m_allocator->destroyImage(image);
+            image = {};
+            return false;
+        }
+
+        std::memcpy(staging.mapped, pixels, size_t(byteSize));
+        m_allocator->flush(staging.allocation, 0, byteSize);
+
+        VkCommandPoolCreateInfo poolInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = m_graphicsQueueFamilyIndex,
+        };
+        VkCommandPool pool = VK_NULL_HANDLE;
+        vkCreateCommandPool(m_device, &poolInfo, nullptr, &pool);
+
+        VkCommandBufferAllocateInfo allocInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+
+        VkCommandBufferBeginInfo beginInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkImageMemoryBarrier toDst = makeImageBarrier(
+            image.image,
+            0,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkBufferImageCopy region =
+        {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = { width, height, 1 },
+        };
+        vkCmdCopyBufferToImage(cmd, staging.buffer, image.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        VkImageMemoryBarrier toGeneral = makeImageBarrier(
+            image.image,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo submitInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(m_graphicsQueue);
+
+        vkDestroyCommandPool(m_device, pool, nullptr);
+        m_allocator->destroyBuffer(staging);
+        return true;
+    }
+
+    void loadFileTextures()
+    {
+        destroyFileTextures();
+        if (!m_allocator)
+        {
+            return;
+        }
+
+        for (const Effect& effect : m_library.effects)
+        {
+            for (const ChannelBinding& binding : effect.channels)
+            {
+                if (binding.kind != ChannelSourceKind::Texture || binding.texturePath.empty())
+                {
+                    continue;
+                }
+                if (m_fileTextures.contains(binding.texturePath))
+                {
+                    continue;
+                }
+
+                const std::string fullPath = "data/" + binding.texturePath;
+                File file(fullPath);
+                if (!file.size())
+                {
+                    printLine(Print::Error, "Missing texture: {}", fullPath);
+                    m_fileTextures.emplace(binding.texturePath, FileTexture{});
+                    continue;
+                }
+
+                printLine(Print::Info, "Loading texture: {}", fullPath);
+                const Format rgba8(32, Format::UNORM, Format::RGBA, 8, 8, 8, 8);
+                Bitmap bitmap(file, rgba8);
+                if (!bitmap.width || !bitmap.height || !bitmap.image)
+                {
+                    printLine(Print::Error, "Failed to decode texture: {}", fullPath);
+                    m_fileTextures.emplace(binding.texturePath, FileTexture{});
+                    continue;
+                }
+
+                FileTexture tex;
+                tex.width = u32(bitmap.width);
+                tex.height = u32(bitmap.height);
+
+                // Contiguous RGBA8 copy if stride has padding.
+                std::vector<u8> packed;
+                const void* pixels = bitmap.image;
+                VkDeviceSize uploadSize = VkDeviceSize(bitmap.stride) * bitmap.height;
+                if (bitmap.stride != size_t(bitmap.width) * 4)
+                {
+                    packed.resize(size_t(bitmap.width) * size_t(bitmap.height) * 4);
+                    for (int y = 0; y < bitmap.height; ++y)
+                    {
+                        std::memcpy(
+                            packed.data() + size_t(y) * size_t(bitmap.width) * 4,
+                            bitmap.image + size_t(y) * bitmap.stride,
+                            size_t(bitmap.width) * 4);
+                    }
+                    pixels = packed.data();
+                    uploadSize = VkDeviceSize(packed.size());
+                }
+                else
+                {
+                    uploadSize = VkDeviceSize(bitmap.width) * VkDeviceSize(bitmap.height) * 4;
+                }
+
+                // sRGB view so albedo samples decode to scene-linear.
+                if (!uploadRgba8Image(tex.image, tex.view, VK_FORMAT_R8G8B8A8_SRGB,
+                        tex.width, tex.height, pixels, uploadSize))
+                {
+                    m_fileTextures.emplace(binding.texturePath, FileTexture{});
+                    continue;
+                }
+
+                printLine(Print::Info, "Texture: {} ({}x{} sRGB)",
+                    fullPath, tex.width, tex.height);
+                m_fileTextures.emplace(binding.texturePath, std::move(tex));
+            }
+        }
     }
 
     void recreateRenderTargets(VkExtent2D extent)

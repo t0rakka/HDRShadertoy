@@ -1,0 +1,315 @@
+#version 450
+
+/*
+    Shader:  Refractive Gem
+    Author:  Unknown / as on Shadertoy
+    License: Unknown / as on Shadertoy
+*/
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D uTarget;
+
+layout(push_constant) uniform Push
+{
+    float time;
+    float _pad0;
+    vec2 resolution;
+    vec4 mouse;
+} push;
+
+#define iTime push.time
+#define iResolution vec3(push.resolution, 1.0)
+#define iMouse push.mouse
+
+const float maxDist = 1000.;
+const float epsilon = 0.01;
+const int steps = 300;
+const vec3 lightDir = normalize(vec3(1, 0.5, 1));
+
+// Shadertoy-authored sRGB look values — decoded to scene-linear below.
+const vec3 bgColorSrgb = vec3(.05, 0.0, .0);
+const vec3 gemColorSrgb = vec3(0.85, 0.11, 0.11);
+
+#define GEM_TYPE 0 // 0 or 1
+const int colorIndex    = 2; // 0 or 7, 0 is gemColor
+const int maxReflection = 7;
+const float rlCoef      = 0.9; // refraction loss coefficient
+const float cameraDist  = 8.;
+
+#define PAL1 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,1.0,1.0),vec3(0.0,0.33,0.67)
+#define PAL2 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,1.0,1.0),vec3(0.0,0.10,0.20)
+#define PAL3 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,1.0,1.0),vec3(0.3,0.20,0.20)
+#define PAL4 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,1.0,0.5),vec3(0.8,0.90,0.30)
+#define PAL5 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,0.7,0.4),vec3(0.0,0.15,0.20)
+#define PAL6 vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(2.0,1.0,0.0),vec3(0.5,0.20,0.25)
+#define PAL7 vec3(0.8,0.5,0.4),vec3(0.2,0.4,0.2),vec3(2.0,1.0,1.0),vec3(0.0,0.25,0.25)
+
+// Approximate sRGB EOTF — enough for authored constants / palette RGB.
+vec3 toLinear(vec3 c)
+{
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+// https://iquilezles.org/articles/palettes/
+// cosine based palette, 4 vec3 params (keep a/b/c/d as authored; linearize RGB result)
+vec3 palette(float t,vec3 a,vec3 b,vec3 c,vec3 d )
+{
+    return a + b*cos( 6.283185*(c*t+d) );
+}
+
+// Extinction / matter color in scene-linear (SigmaE).
+vec3 getPalette(float t){
+    vec3 gemColor = toLinear(gemColorSrgb);
+    if (colorIndex == 0)
+        return 1.0 - gemColor;
+    else if (colorIndex == 1)
+        return toLinear(palette(t, PAL1));
+    else if (colorIndex == 2)
+        return toLinear(palette(t, PAL2));
+    else if (colorIndex == 3)
+        return toLinear(palette(t, PAL3));
+    else if (colorIndex == 4)
+        return toLinear(palette(t, PAL4));
+    else if (colorIndex == 5)
+        return toLinear(palette(t, PAL5));
+    else if (colorIndex == 6)
+        return toLinear(palette(t, PAL6));
+    else if (colorIndex == 7)
+        return toLinear(palette(t, PAL7));
+    return 1.0 - gemColor;
+}
+
+// https://www.shadertoy.com/view/3s3GDn
+float getGlow(float dist, float radius, float intensity){
+	return max(0.0, pow(radius/max(dist, 1e-5), intensity));
+}
+
+mat2 rot2D(float angle)
+{
+    float c = cos(angle);
+    float s = sin(angle);
+    return mat2(c, s, -s, c);
+}
+
+float sdfOctahedron( vec3 p, float s)
+{
+  p = abs(p);
+  return (p.x+p.y+p.z-s)*0.57735027;
+}
+
+float sdfSphere(vec3 pos, float s)
+{
+  return length(pos) - s;
+}
+
+float sdfPlaneCut(float sdf, vec3 p, vec3 n, float h)
+{
+  return max(sdf, dot(p,n) + h);
+}
+
+#define N normalize
+
+float sdfCustomGem(vec3 p){
+    p = abs(p);
+    p.xz = abs(p.xz);
+    float d = sdfSphere(p, 6.6);
+
+    d = sdfPlaneCut(d, p, vec3(0, +1, 0), -2.0);
+
+    const float angle = -45.;
+
+    vec3 q = p;
+    float h = -4.73;
+    d = sdfPlaneCut(d, q, N(vec3(0, 1, 1)), h);
+    q.xz *= rot2D(radians(angle));
+    d = sdfPlaneCut(d, q, N(vec3(0, 1, 1)), h);
+    q.xz *= rot2D(radians(angle));
+    d = sdfPlaneCut(d, q, N(vec3(0, 1, 1)), h);
+
+    q = p;
+    h = -3.5;
+    q.xz *= rot2D(radians(angle / 2.0));
+    d = sdfPlaneCut(d, q, N(vec3(0, 2, 1)), h);
+    q.xz *= rot2D(radians(angle));
+    d = sdfPlaneCut(d, q, N(vec3(0, 2, 1)), h);
+
+    q = p;
+    h = -2.89;
+    d = sdfPlaneCut(d, q, N(vec3(0, 3.5, 1)), h);
+    q.xz *= rot2D(radians(angle));
+    d = sdfPlaneCut(d, q, N(vec3(0, 3.5, 1)), h);
+    q.xz *= rot2D(radians(angle));
+    d = sdfPlaneCut(d, q, N(vec3(0, 3.5, 1)), h);
+
+    return d;
+}
+
+float sdfOctahedronGem(vec3 pos){
+    vec3 p = pos;
+    float offset = 3.5;
+
+    float s1 = sdfOctahedron(p, 5.);
+
+    p = pos;
+    p.y += offset;
+    float s2 = sdfOctahedron(p, 2.);
+    p = pos;
+    p.y -= offset;
+    float s3 = sdfOctahedron(p, 2.);
+
+    return min(min(s1, s2),s3);
+}
+
+float sdfMap(vec3 pos)
+{
+    pos.zx *= rot2D(iTime * 0.2);
+
+#if GEM_TYPE == 0
+    return sdfOctahedronGem(pos);
+#else
+    return sdfCustomGem(pos);
+#endif
+}
+
+vec3 calculateNormal(vec3 pos)
+{
+    vec2 e = vec2(1.0,-1.0)*0.5773*0.001;
+    return normalize( e.xyy*sdfMap( pos + e.xyy ) +
+					  e.yyx*sdfMap( pos + e.yyx ) +
+					  e.yxy*sdfMap( pos + e.yxy ) +
+					  e.xxx*sdfMap( pos + e.xxx ) );
+}
+
+float diffuse(vec3 normal, vec3 lightDir){
+    return max(dot(normal, lightDir), 0.0);
+}
+
+float specular(vec3 rayDir, vec3 normal, vec3 lightDir, float po){
+    vec3 reflectDir = reflect(lightDir, normal);
+
+    float spec = pow(max(dot(rayDir, reflectDir), 0.0), po);
+    return spec;
+}
+
+vec3 raymarch(vec3 rayOrigin, vec3 rayDir, inout vec3 transmittance, inout vec3 scatteredLight)
+{
+    float m_dist = maxDist;
+    float t = 0.0; // total dist
+    vec3 pos = vec3(0.0);
+    float prev_dist = maxDist;
+    vec3 prev_pos = vec3(0.0);
+    int reflexion = 0;
+    float refractionLoss = 1.0;
+    bool first = true;
+    vec3 originalRayDir = rayDir;
+
+    vec3 SigmaE = 1.0 - toLinear(gemColorSrgb);
+
+    for (int i = 0; i < steps; i++){
+        prev_pos = pos;
+        pos = rayOrigin + rayDir * t;
+        prev_dist = m_dist;
+        m_dist = sdfMap(pos);
+
+        if (m_dist < 0.0){
+            float density = 0.1 / refractionLoss;
+            vec3 Tr = exp(-SigmaE * density * abs(m_dist));
+            transmittance *= Tr;
+        }
+
+        if (sign(prev_dist) != sign(m_dist)){ // ray went through surface if sign flip
+            vec3 normal = calculateNormal(pos);
+            float dif = diffuse(normal, lightDir) * 0.05;
+            if (prev_dist < 0.){ // if ray was inside the object, reflect
+                reflexion++;
+                if (reflexion > maxReflection)
+                    break;
+                rayDir = reflect(rayDir, normal);
+                rayOrigin = prev_pos;
+                t = 0.;
+                SigmaE = getPalette(rayDir.x);
+                // SigmaE = getPalette(iTime * 0.05 + length(pos * 0.4));
+                refractionLoss *= rlCoef;
+                continue;
+            }
+            else if (first){
+                first = false;
+                rayDir = refract(rayDir, normal, 0.95);
+                originalRayDir = rayDir;
+
+                rayOrigin = prev_pos;
+                t = 0.;
+            }
+            float spec = specular(rayDir, normal, lightDir, 32.) * 0.5;
+            scatteredLight += (spec + dif) * refractionLoss * transmittance;
+        }
+
+        if (m_dist > maxDist /*|| m_dist < epsilon*/)
+            break;
+
+        t += max(abs(m_dist), epsilon);
+    }
+
+    scatteredLight += getGlow(1.0-dot(originalRayDir, lightDir), 0.00015, .5); // to see the sun through the gem
+
+    return vec3(pos);
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    vec2 uv = (fragCoord.xy * 2.0 - iResolution.xy) / iResolution.y; // [-1; 1]
+    vec2 mx = (iMouse.xy * 2.0 - iResolution.xy) / iResolution.y;
+
+    vec3 rayOrigin = vec3(0, 0, -cameraDist);
+    vec3 rayDir = normalize(vec3(uv, 1.0));
+
+    if (iMouse.x < 10. && iMouse.y < 10.){
+        float x = radians(45.),y = radians(9.);
+        rayOrigin.yz *= rot2D(y);
+        rayDir.yz *= rot2D(y);
+
+        rayOrigin.xz *= rot2D(x);
+        rayDir.xz *= rot2D(x);
+    }
+    else{
+        mx*=4.0;
+        rayOrigin.yz *= rot2D(mx.y);
+        rayDir.yz *= rot2D(mx.y);
+
+        rayOrigin.xz *= rot2D(mx.x);
+        rayDir.xz *= rot2D(mx.x);
+    }
+
+    vec3 scatteredLight = vec3(0.0);
+    vec3 transmittance = vec3(1.0);
+    vec3 result = raymarch(rayOrigin, rayDir, transmittance, scatteredLight);
+
+    // fragColor = vec4(result, 1.0);return; // fun result
+
+    vec3 background = toLinear(bgColorSrgb);
+    float mu = dot(rayDir, lightDir);
+    background += getGlow(1.0-mu, 0.0002, .4);
+
+    vec3 color = background;
+    if (transmittance.r < 1.0)
+        color = transmittance + (scatteredLight);
+
+    // Keep scene-linear HDR — host does resolve/tonemap for the swapchain.
+    fragColor = vec4(max(color, vec3(0.0)), 1.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 fragColor;
+    vec2 fragCoord = vec2(float(pixel.x), float(size.y - pixel.y - 1)) + 0.5;
+    mainImage(fragColor, fragCoord);
+    imageStore(uTarget, pixel, vec4(fragColor.rgb, 1.0));
+}

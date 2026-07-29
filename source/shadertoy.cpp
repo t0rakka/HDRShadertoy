@@ -1785,6 +1785,7 @@ public:
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
+            m_outputOptions.tonemap = TonemapMode::Reinhard;
             m_renderTarget->resolve(cmd, swapchain(), imageIndex, &m_outputOptions);
         }
 

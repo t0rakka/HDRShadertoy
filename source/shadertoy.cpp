@@ -664,9 +664,9 @@ protected:
     bool m_mouseDown = false;
 
 public:
-    ShadertoyWindow(VkInstance instance, int width, int height, const VulkanDeviceConfig* config,
+    ShadertoyWindow(VulkanContext& context, int width, int height, const VulkanDeviceConfig* config,
                      ShaderLibrary library, size_t initialIndex = 0)
-        : VulkanWindow(instance, width, height, 0, config)
+        : VulkanWindow(context, width, height, 0, config)
         , m_library(std::move(library))
         , m_effectIndex(std::min(initialIndex, m_library.effects.empty() ? 0 : m_library.effects.size() - 1))
     {
@@ -674,7 +674,7 @@ public:
 
     void onDeviceReady() override
     {
-        m_allocator = std::make_unique<Allocator>(instance(), m_physicalDevice, m_device, VK_API_VERSION_1_3);
+        m_allocator = std::make_unique<Allocator>(instance(), physicalDevice(), device(), VK_API_VERSION_1_3);
 
         m_hdrSwapchain = isHDR(surfaceFormat());
         m_outputOptions = defaultOutputOptions(surfaceFormat(), 1.0f);
@@ -705,9 +705,9 @@ public:
 
     ~ShadertoyWindow()
     {
-        if (m_device != VK_NULL_HANDLE)
+        if (device() != VK_NULL_HANDLE)
         {
-            vkDeviceWaitIdle(m_device);
+            vkDeviceWaitIdle(device());
             destroyPassGpu();
             destroyComputeResources();
             destroyNoiseTexture();
@@ -755,7 +755,7 @@ public:
             .pBindings = bindings.data(),
         };
 
-        vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorLayout);
+        vkCreateDescriptorSetLayout(device(), &layoutInfo, nullptr, &m_descriptorLayout);
 
         VkPushConstantRange pushRange =
         {
@@ -773,7 +773,7 @@ public:
             .pPushConstantRanges = &pushRange,
         };
 
-        vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
+        vkCreatePipelineLayout(device(), &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
 
         // Enough for one effect with up to 5 passes (A-D + Image).
         constexpr u32 kMaxPasses = 5;
@@ -790,7 +790,7 @@ public:
             .pPoolSizes = poolSizes.data(),
         };
 
-        vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool);
+        vkCreateDescriptorPool(device(), &poolInfo, nullptr, &m_descriptorPool);
 
         VkSamplerCreateInfo samplerInfo =
         {
@@ -803,12 +803,12 @@ public:
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .maxLod = 0.0f,
         };
-        vkCreateSampler(m_device, &samplerInfo, nullptr, &m_sampler);
+        vkCreateSampler(device(), &samplerInfo, nullptr, &m_sampler);
 
         samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        vkCreateSampler(m_device, &samplerInfo, nullptr, &m_samplerRepeat);
+        vkCreateSampler(device(), &samplerInfo, nullptr, &m_samplerRepeat);
     }
 
     void destroyPassGpu()
@@ -817,12 +817,12 @@ public:
         {
             if (pass.pipeline != VK_NULL_HANDLE)
             {
-                vkDestroyPipeline(m_device, pass.pipeline, nullptr);
+                vkDestroyPipeline(device(), pass.pipeline, nullptr);
                 pass.pipeline = VK_NULL_HANDLE;
             }
             if (pass.module != VK_NULL_HANDLE)
             {
-                vkDestroyShaderModule(m_device, pass.module, nullptr);
+                vkDestroyShaderModule(device(), pass.module, nullptr);
                 pass.module = VK_NULL_HANDLE;
             }
             pass.set = VK_NULL_HANDLE;
@@ -831,7 +831,7 @@ public:
 
         if (m_descriptorPool != VK_NULL_HANDLE)
         {
-            vkResetDescriptorPool(m_device, m_descriptorPool, 0);
+            vkResetDescriptorPool(device(), m_descriptorPool, 0);
         }
     }
 
@@ -842,7 +842,7 @@ public:
             return;
         }
 
-        vkDeviceWaitIdle(m_device);
+        vkDeviceWaitIdle(device());
         destroyPassGpu();
 
         m_effectIndex = index;
@@ -865,7 +865,7 @@ public:
             }
 
             const std::vector<u32> spirv(spirvSpan.begin(), spirvSpan.end());
-            gpu.module = Compiler::createShaderModule(m_device, spirv);
+            gpu.module = Compiler::createShaderModule(device(), spirv);
 
             VkPipelineShaderStageCreateInfo stage =
             {
@@ -882,13 +882,13 @@ public:
                 .layout = m_pipelineLayout,
             };
 
-            vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &gpu.pipeline);
+            vkCreateComputePipelines(device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &gpu.pipeline);
             if (gpu.pipeline == VK_NULL_HANDLE)
             {
                 printLine(Print::Error, "vkCreateComputePipelines failed: {} [{}]", effect.name, passIdName(compiled.id));
                 if (gpu.module != VK_NULL_HANDLE)
                 {
-                    vkDestroyShaderModule(m_device, gpu.module, nullptr);
+                    vkDestroyShaderModule(device(), gpu.module, nullptr);
                 }
                 continue;
             }
@@ -901,12 +901,12 @@ public:
                 .pSetLayouts = &m_descriptorLayout,
             };
 
-            VkResult result = vkAllocateDescriptorSets(m_device, &allocInfo, &gpu.set);
+            VkResult result = vkAllocateDescriptorSets(device(), &allocInfo, &gpu.set);
             if (result != VK_SUCCESS)
             {
                 printLine(Print::Error, "vkAllocateDescriptorSets: {}", getString(result));
-                vkDestroyPipeline(m_device, gpu.pipeline, nullptr);
-                vkDestroyShaderModule(m_device, gpu.module, nullptr);
+                vkDestroyPipeline(device(), gpu.pipeline, nullptr);
+                vkDestroyShaderModule(device(), gpu.module, nullptr);
                 continue;
             }
 
@@ -939,31 +939,31 @@ public:
 
         if (m_sampler != VK_NULL_HANDLE)
         {
-            vkDestroySampler(m_device, m_sampler, nullptr);
+            vkDestroySampler(device(), m_sampler, nullptr);
             m_sampler = VK_NULL_HANDLE;
         }
 
         if (m_samplerRepeat != VK_NULL_HANDLE)
         {
-            vkDestroySampler(m_device, m_samplerRepeat, nullptr);
+            vkDestroySampler(device(), m_samplerRepeat, nullptr);
             m_samplerRepeat = VK_NULL_HANDLE;
         }
 
         if (m_descriptorPool != VK_NULL_HANDLE)
         {
-            vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+            vkDestroyDescriptorPool(device(), m_descriptorPool, nullptr);
             m_descriptorPool = VK_NULL_HANDLE;
         }
 
         if (m_pipelineLayout != VK_NULL_HANDLE)
         {
-            vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+            vkDestroyPipelineLayout(device(), m_pipelineLayout, nullptr);
             m_pipelineLayout = VK_NULL_HANDLE;
         }
 
         if (m_descriptorLayout != VK_NULL_HANDLE)
         {
-            vkDestroyDescriptorSetLayout(m_device, m_descriptorLayout, nullptr);
+            vkDestroyDescriptorSetLayout(device(), m_descriptorLayout, nullptr);
             m_descriptorLayout = VK_NULL_HANDLE;
         }
     }
@@ -1163,7 +1163,7 @@ public:
                 };
             }
 
-            vkUpdateDescriptorSets(m_device, u32(writes.size()), writes.data(), 0, nullptr);
+            vkUpdateDescriptorSets(device(), u32(writes.size()), writes.data(), 0, nullptr);
         }
     }
 
@@ -1171,10 +1171,10 @@ public:
     {
         return std::make_unique<RenderTarget>(RenderTarget::CreateInfo
         {
-            .device = m_device,
+            .device = device(),
             .allocator = m_allocator.get(),
-            .queue = m_graphicsQueue,
-            .queueFamily = m_graphicsQueueFamilyIndex,
+            .queue = graphicsQueue(),
+            .queueFamily = graphicsQueueFamilyIndex(),
             .format = RenderTargetFormat::Float16,
             .extent = extent,
         });
@@ -1234,7 +1234,7 @@ public:
     {
         if (m_noiseView != VK_NULL_HANDLE)
         {
-            vkDestroyImageView(m_device, m_noiseView, nullptr);
+            vkDestroyImageView(device(), m_noiseView, nullptr);
             m_noiseView = VK_NULL_HANDLE;
         }
         if (m_noiseImage && m_allocator)
@@ -1288,7 +1288,7 @@ public:
             },
         };
 
-        if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_noiseView) != VK_SUCCESS)
+        if (vkCreateImageView(device(), &viewInfo, nullptr, &m_noiseView) != VK_SUCCESS)
         {
             printLine(Print::Error, "Failed to create noise image view");
             destroyNoiseTexture();
@@ -1318,10 +1318,10 @@ public:
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-            .queueFamilyIndex = m_graphicsQueueFamilyIndex,
+            .queueFamilyIndex = graphicsQueueFamilyIndex(),
         };
         VkCommandPool pool = VK_NULL_HANDLE;
-        vkCreateCommandPool(m_device, &poolInfo, nullptr, &pool);
+        vkCreateCommandPool(device(), &poolInfo, nullptr, &pool);
 
         VkCommandBufferAllocateInfo allocInfo =
         {
@@ -1331,7 +1331,7 @@ public:
             .commandBufferCount = 1,
         };
         VkCommandBuffer cmd = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+        vkAllocateCommandBuffers(device(), &allocInfo, &cmd);
 
         VkCommandBufferBeginInfo beginInfo =
         {
@@ -1382,10 +1382,10 @@ public:
             .commandBufferCount = 1,
             .pCommandBuffers = &cmd,
         };
-        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_graphicsQueue);
+        vkQueueSubmit(graphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue());
 
-        vkDestroyCommandPool(m_device, pool, nullptr);
+        vkDestroyCommandPool(device(), pool, nullptr);
         m_allocator->destroyBuffer(staging);
 
         printLine(Print::Info, "Noise texture: {}x{} RGBA8", kNoiseSize, kNoiseSize);
@@ -1398,7 +1398,7 @@ public:
             FileTexture& tex = entry.second;
             if (tex.view != VK_NULL_HANDLE)
             {
-                vkDestroyImageView(m_device, tex.view, nullptr);
+                vkDestroyImageView(device(), tex.view, nullptr);
                 tex.view = VK_NULL_HANDLE;
             }
             if (tex.image && m_allocator)
@@ -1454,7 +1454,7 @@ public:
             },
         };
 
-        if (vkCreateImageView(m_device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+        if (vkCreateImageView(device(), &viewInfo, nullptr, &view) != VK_SUCCESS)
         {
             printLine(Print::Error, "Failed to create texture image view");
             m_allocator->destroyImage(image);
@@ -1467,7 +1467,7 @@ public:
         if (!staging || !staging.mapped)
         {
             printLine(Print::Error, "Failed to create texture staging buffer");
-            vkDestroyImageView(m_device, view, nullptr);
+            vkDestroyImageView(device(), view, nullptr);
             view = VK_NULL_HANDLE;
             m_allocator->destroyImage(image);
             image = {};
@@ -1481,10 +1481,10 @@ public:
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-            .queueFamilyIndex = m_graphicsQueueFamilyIndex,
+            .queueFamilyIndex = graphicsQueueFamilyIndex(),
         };
         VkCommandPool pool = VK_NULL_HANDLE;
-        vkCreateCommandPool(m_device, &poolInfo, nullptr, &pool);
+        vkCreateCommandPool(device(), &poolInfo, nullptr, &pool);
 
         VkCommandBufferAllocateInfo allocInfo =
         {
@@ -1494,7 +1494,7 @@ public:
             .commandBufferCount = 1,
         };
         VkCommandBuffer cmd = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+        vkAllocateCommandBuffers(device(), &allocInfo, &cmd);
 
         VkCommandBufferBeginInfo beginInfo =
         {
@@ -1551,10 +1551,10 @@ public:
             .commandBufferCount = 1,
             .pCommandBuffers = &cmd,
         };
-        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_graphicsQueue);
+        vkQueueSubmit(graphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue());
 
-        vkDestroyCommandPool(m_device, pool, nullptr);
+        vkDestroyCommandPool(device(), pool, nullptr);
         m_allocator->destroyBuffer(staging);
         return true;
     }
@@ -1803,7 +1803,7 @@ public:
         const VkExtent2D extent = swapchainExtent();
         VkCommandBuffer cmd = commandBuffer(frame.imageIndex());
         recordCommandBuffer(cmd, frame.imageIndex(), extent, time);
-        frame.submitAndPresent(m_graphicsQueue, cmd);
+        frame.submitAndPresent(graphicsQueue(), cmd);
     }
 
     void onFrame(const FrameInfo& info) override
@@ -1867,7 +1867,7 @@ public:
 
         if (code == KEYCODE_ESC)
         {
-            breakEventLoop();
+            requestQuit();
         }
         else if (code == KEYCODE_F)
         {
@@ -1980,13 +1980,16 @@ int mangoMain(const mango::CommandLine& commands)
     VulkanDeviceConfig deviceConfig {};
     applyRecommendedSurfaceFormats(deviceConfig, forceSdr ? SurfaceFormatIntent::SDR : SurfaceFormatIntent::HDR);
 
-    ShadertoyWindow window(instance, 1280, 720, &deviceConfig, library, initialIndex);
+    VulkanContext context(instance);
+    ShadertoyWindow window(context, 1280, 720, &deviceConfig, library, initialIndex);
 
     EventLoopConfig config;
     config.mode = FrameMode::Continuous;
     config.waitForFrame = true;
 
-    window.enterEventLoop(config);
+    EventLoop loop;
+    loop.attach(window, config);
+    loop.run();
 
     return 0;
 }
